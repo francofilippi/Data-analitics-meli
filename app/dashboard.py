@@ -34,11 +34,45 @@ def _datos():
 ventas, visitas, preguntas = _datos()
 
 # --------------------------------------------------------------------------- #
+# Autenticacion por token en la URL                                            #
+# --------------------------------------------------------------------------- #
+# Sin secrets configurados (dev local) → modo admin sin restriccion.
+# Con secrets: token admin ve todo; token seller ve solo su cliente.
+params = st.query_params
+token_url = params.get("token", "")
+cliente_url = params.get("cliente", "")
+
+locked_cliente: str | None = None  # None = admin (selector libre)
+
+try:
+    tokens: dict = dict(st.secrets.get("tokens", {}))
+    if tokens:
+        admin_token = tokens.get("admin", "")
+        if token_url and token_url == admin_token:
+            locked_cliente = None  # admin
+        elif token_url and cliente_url:
+            esperado = tokens.get(cliente_url, "")
+            if esperado and token_url == esperado:
+                locked_cliente = cliente_url
+            else:
+                st.error("🔒 Token inválido o expirado. Pedí tu link actualizado.")
+                st.stop()
+        else:
+            # Sin token → acceso admin (útil mientras no hay secrets configurados)
+            locked_cliente = None
+except Exception:
+    locked_cliente = None  # dev local sin secrets.toml
+
+# --------------------------------------------------------------------------- #
 # Sidebar                                                                      #
 # --------------------------------------------------------------------------- #
 st.sidebar.title("📊 Mercado Libre")
 clientes = sorted(ventas["cliente_ml"].unique())
-cliente = st.sidebar.selectbox("Cliente", clientes)
+if locked_cliente:
+    cliente = locked_cliente
+    st.sidebar.markdown(f"**Cuenta:** {cliente}")
+else:
+    cliente = st.sidebar.selectbox("Cliente", clientes)
 
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
