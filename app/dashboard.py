@@ -237,6 +237,35 @@ if locked_cliente:
 else:
     cliente = st.sidebar.selectbox("Cliente", clientes)
 
+# Pre-carga de caché (solo admin con sellers reales). Útil después de cada
+# redeploy: deja en /tmp un año de órdenes + la vista de 30 días de cada seller,
+# así los clientes entran y carga al instante.
+if locked_cliente is None and _clientes_ml:
+    with st.sidebar.expander("⚙️ Mantenimiento (admin)"):
+        st.caption(
+            "El caché vive en /tmp y se borra al redeployar o dormir la app. "
+            "Tocá esto una vez después de cada deploy."
+        )
+        if st.button("🔥 Pre-cargar 1 año (todos los sellers)"):
+            _hoy = _date.today()
+            _mes_actual = pd.Timestamp(_date(_hoy.year, _hoy.month, 1))
+            _hasta_hist = _mes_actual - pd.Timedelta(days=1)
+            _desde_1a = pd.Timestamp(_hoy - _td(days=365))
+            _d30 = pd.Timestamp(_hoy) - pd.Timedelta(days=29)
+            _prog = st.progress(0.0, text="Pre-cargando…")
+            _n = len(_clientes_ml)
+            for _i, _c in enumerate(_clientes_ml):
+                if not _ml_client(_c):
+                    continue
+                try:
+                    _ventas_light(_c, str(_desde_1a.date()), str(_hasta_hist.date()))
+                    _cargar_rango(_c, _d30, pd.Timestamp(_hoy), True)
+                except Exception as e:
+                    st.warning(f"{_c}: {e}")
+                _prog.progress((_i + 1) / _n, text=f"{_c} listo ({_i + 1}/{_n})")
+            _prog.empty()
+            st.success("Caché pre-cargada ✅")
+
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
 
