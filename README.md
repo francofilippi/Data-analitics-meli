@@ -45,6 +45,23 @@ jupyter notebook notebooks/01_exploracion.ipynb
 
 ---
 
+## Datos reales + persistencia (Streamlit Cloud)
+
+Las credenciales ML de cada seller y los tokens de acceso van en **Secrets** de
+Streamlit (ver `.streamlit/secrets.toml.example`), nunca en el repo.
+
+El histórico se guarda en **Supabase (Postgres)** para que sea durable: cada mes
+cerrado se baja de ML una sola vez y se guarda; cuando un seller entra, lee los
+meses guardados al instante y solo consulta el mes en curso. Sin Supabase el
+caché es efímero (`/tmp`) y se pierde al redeployar o dormir la app.
+
+Setup: creá un proyecto en supabase.com y pegá el connection string del
+*Connection Pooler* en Secrets como `[supabase].dsn`. La tabla `ml_cache` se
+crea sola. Desde el dashboard (admin) → **⚙️ Mantenimiento → Pre-cargar 1 año**
+para llenar el histórico de todos los sellers de una.
+
+---
+
 ## Conceptos de data science que vas a aprender
 
 | Tema | Donde |

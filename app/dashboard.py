@@ -51,133 +51,99 @@ def _ml_client(nombre: str):
 
 
 # --------------------------------------------------------------------------- #
-# Cache en disco — /tmp persiste entre reruns dentro de la misma instancia    #
+# Carga de datos — persistente por mes (Supabase) + mes en curso en vivo      #
 # --------------------------------------------------------------------------- #
 from datetime import date as _date, timedelta as _td
 
-# Bump de versión = invalida el cache viejo en disco.
-#  v2: arregla filtro de fechas de /orders/search (datos de todo el año).
-#  v3: medio_entrega real + provincia vía /shipments (antes todo ME2).
-_DISK_CACHE = Path("/tmp/ml_dash_cache_v3")
+from src import store  # noqa: E402
 
 
-def _pk(nombre: str, tag: str, kind: str) -> Path:
-    return _DISK_CACHE / f"{nombre}_{tag}_{kind}.parquet"
+def _meses(desde: pd.Timestamp, hasta: pd.Timestamp) -> list[pd.Timestamp]:
+    """Primer día de cada mes calendario que toca el rango."""
+    cur = pd.Timestamp(desde.year, desde.month, 1)
+    out = []
+    while cur <= hasta:
+        out.append(cur)
+        cur = cur + pd.offsets.MonthBegin(1)
+    return out
 
 
-def _disk_load(nombre: str, tag: str):
-    """Carga (ventas, visitas, preguntas) desde disco. None si no existe."""
-    try:
-        paths = [_pk(nombre, tag, k) for k in ("v", "vis", "preg")]
-        if all(p.exists() for p in paths):
-            return tuple(pd.read_parquet(p) for p in paths)
-    except Exception:
-        pass
-    return None
+def _filtrar_fechas(df, desde, hasta):
+    if df is None or df.empty or "fecha" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    f = pd.to_datetime(df["fecha"])
+    return df[(f >= desde) & (f <= hasta)]
 
 
-def _disk_save(v, vis, preg, nombre: str, tag: str) -> None:
-    try:
-        _DISK_CACHE.mkdir(parents=True, exist_ok=True)
-        for df, kind in [(v, "v"), (vis, "vis"), (preg, "preg")]:
-            df.to_parquet(_pk(nombre, tag, kind), index=False)
-    except Exception:
-        pass
+def _cat(lst) -> pd.DataFrame:
+    lst = [d for d in lst if d is not None and not d.empty]
+    return pd.concat(lst, ignore_index=True) if lst else pd.DataFrame()
 
 
-def _concat3(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
-    if a.empty:
-        return b
-    if b.empty:
-        return a
-    return pd.concat([a, b], ignore_index=True)
-
-
-@st.cache_data(ttl=None, show_spinner="⏳ Cargando historial de ML…")
-def _datos_historico(nombre: str, desde: str, hasta: str, usar_ml: bool):
-    """
-    Meses cerrados (antes del mes actual) — datos inmutables.
-    TTL infinito en sesión + parquet en /tmp para sobrevivir reinicios.
-    """
-    if usar_ml:
-        tag = desde.replace("-", "") + "_" + hasta.replace("-", "")
-        cached = _disk_load(nombre, tag)
-        if cached:
-            return cached
-    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
-    client = _ml_client(nombre) if usar_ml else None
-    result = metricas.cargar_datos_cliente(nombre, d, h, client)
-    if usar_ml:
-        tag = desde.replace("-", "") + "_" + hasta.replace("-", "")
-        _disk_save(*result, nombre, tag)
-    return result
-
-
-@st.cache_data(ttl=3600, show_spinner="🔄 Actualizando datos del mes…")
-def _datos_reciente(nombre: str, desde: str, hasta: str, usar_ml: bool):
-    """Mes en curso — puede cambiar. TTL 1 hora."""
-    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
-    client = _ml_client(nombre) if usar_ml else None
-    return metricas.cargar_datos_cliente(nombre, d, h, client)
-
-
-def _cargar_rango(
-    nombre: str,
-    desde: pd.Timestamp,
-    hasta: pd.Timestamp,
-    usar_ml: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Divide en histórico (meses cerrados, cacheados en disco) + reciente (mes actual, TTL 1h).
-    Los meses cerrados se persisten en /tmp/ml_dash_cache como parquet.
-    """
-    hoy = _date.today()
-    mes_actual = pd.Timestamp(_date(hoy.year, hoy.month, 1))
-
-    if usar_ml and desde < mes_actual <= hasta:
-        hasta_hist = mes_actual - pd.Timedelta(days=1)
-        v_h, vis_h, preg_h = _datos_historico(nombre, str(desde.date()), str(hasta_hist.date()), True)
-        v_r, vis_r, preg_r = _datos_reciente(nombre, str(mes_actual.date()), str(hasta.date()), True)
-        return _concat3(v_h, v_r), _concat3(vis_h, vis_r), _concat3(preg_h, preg_r)
-
-    if usar_ml and hasta < mes_actual:
-        return _datos_historico(nombre, str(desde.date()), str(hasta.date()), True)
-
-    return _datos_reciente(nombre, str(desde.date()), str(hasta.date()), usar_ml)
-
-
-@st.cache_data(ttl=None, show_spinner="⏳ Cargando histórico 24 meses…")
-def _ventas_light(nombre: str, desde: str, hasta: str):
-    """Solo órdenes (sin envíos/visitas) para series largas. Cacheado en /tmp."""
-    tag = "light_" + desde.replace("-", "") + "_" + hasta.replace("-", "")
-    cached = _disk_load(nombre, tag)
-    if cached:
-        return cached[0]
-    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
+def _fetch_mes(nombre, m_start, m_end, full):
     client = _ml_client(nombre)
-    v, vis, preg = metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=True)
-    _disk_save(v, vis, preg, nombre, tag)
-    return v
+    return metricas.cargar_datos_cliente(nombre, m_start, m_end, client, solo_ventas=not full)
 
 
-@st.cache_data(ttl=3600)
-def _ventas_light_reciente(nombre: str, desde: str, hasta: str):
+def _cargar_persistente(nombre, desde, hasta, full):
+    """
+    Arma el rango mes por mes:
+      - Mes cerrado → se lee de Supabase; si falta, se baja de ML el mes
+        calendario completo y se guarda (durable, una sola vez).
+      - Mes en curso → siempre en vivo (puede cambiar), no se guarda.
+    Así un seller que entra esporádicamente solo baja los meses nuevos.
+    """
+    mes_actual = pd.Timestamp(_date.today().replace(day=1))
+    kinds = ("v", "vis", "preg") if full else ("lv",)
+    acc = {k: [] for k in kinds}
+
+    for mes in _meses(desde, hasta):
+        m_end = mes + pd.offsets.MonthEnd(1)
+        if mes < mes_actual:
+            dfs = {k: store.load_month(nombre, mes.date(), k) for k in kinds}
+            if any(dfs[k] is None for k in kinds):
+                v, vis, preg = _fetch_mes(nombre, mes, m_end, full)
+                src = {"v": v, "vis": vis, "preg": preg, "lv": v}
+                for k in kinds:
+                    store.save_month(nombre, mes.date(), k, src[k])
+                    dfs[k] = src[k]
+            for k in kinds:
+                acc[k].append(_filtrar_fechas(dfs[k], desde, hasta))
+        else:
+            v, vis, preg = _fetch_mes(nombre, max(desde, mes), min(hasta, m_end), full)
+            src = {"v": v, "vis": vis, "preg": preg, "lv": v}
+            for k in kinds:
+                acc[k].append(src[k])
+
+    if full:
+        return _cat(acc["v"]), _cat(acc["vis"]), _cat(acc["preg"])
+    return _cat(acc["lv"]), pd.DataFrame(), pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner="Cargando datos de Mercado Libre…")
+def _rango(nombre: str, desde: str, hasta: str, full: bool, usar_ml: bool):
+    """Resultado cacheado 1h. Con Supabase los meses cerrados ya están guardados."""
     d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
+    if not usar_ml:
+        return metricas.cargar_datos_cliente(nombre, d, h, None, solo_ventas=not full)
+    if store.enabled():
+        return _cargar_persistente(nombre, d, h, full)
+    # Sin store configurado: baja todo en vivo (cacheado 1h).
     client = _ml_client(nombre)
-    v, _, _ = metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=True)
-    return v
+    return metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=not full)
+
+
+def _cargar_rango(nombre, desde, hasta, usar_ml):
+    return _rango(nombre, str(desde.date()), str(hasta.date()), True, usar_ml)
 
 
 def _historico_cliente(nombre: str, usar_ml: bool):
-    """Ventas de los últimos 24 meses para MoM/YoY (modo liviano: solo órdenes)."""
+    """Ventas de los últimos ~24 meses para MoM/YoY (modo liviano: solo órdenes)."""
     hoy = _date.today()
-    mes_actual = pd.Timestamp(_date(hoy.year, hoy.month, 1))
-    hasta_hist = mes_actual - pd.Timedelta(days=1)
-    desde_24m = pd.Timestamp(hoy - _td(days=730))
     if usar_ml:
-        v_h = _ventas_light(nombre, str(desde_24m.date()), str(hasta_hist.date()))
-        v_r = _ventas_light_reciente(nombre, str(mes_actual.date()), str(pd.Timestamp(hoy).date()))
-        return _concat3(v_h, v_r)
+        desde = pd.Timestamp(hoy - _td(days=730))
+        v, _, _ = _rango(nombre, str(desde.date()), str(pd.Timestamp(hoy).date()), False, True)
+        return v
     ventas, _, _ = metricas.cargar_datos()
     return ventas[ventas["cliente_ml"] == nombre]
 
@@ -242,29 +208,33 @@ else:
 # así los clientes entran y carga al instante.
 if locked_cliente is None and _clientes_ml:
     with st.sidebar.expander("⚙️ Mantenimiento (admin)"):
-        st.caption(
-            "El caché vive en /tmp y se borra al redeployar o dormir la app. "
-            "Tocá esto una vez después de cada deploy."
-        )
+        _store_ok = store.enabled()
+        if _store_ok:
+            st.caption(
+                "Guarda 1 año de datos por seller en Supabase (durable). "
+                "Una vez hecho, los meses cerrados no se vuelven a bajar nunca."
+            )
+        else:
+            st.caption(
+                "⚠️ Sin Supabase configurado: el caché es efímero. Configurá "
+                "[supabase].dsn en Secrets para que el histórico sea persistente."
+            )
         if st.button("🔥 Pre-cargar 1 año (todos los sellers)"):
-            _hoy = _date.today()
-            _mes_actual = pd.Timestamp(_date(_hoy.year, _hoy.month, 1))
-            _hasta_hist = _mes_actual - pd.Timedelta(days=1)
-            _desde_1a = pd.Timestamp(_hoy - _td(days=365))
-            _d30 = pd.Timestamp(_hoy) - pd.Timedelta(days=29)
+            _hoy = pd.Timestamp(_date.today())
+            _desde_1a = pd.Timestamp(_date.today() - _td(days=365))
             _prog = st.progress(0.0, text="Pre-cargando…")
             _n = len(_clientes_ml)
             for _i, _c in enumerate(_clientes_ml):
                 if not _ml_client(_c):
                     continue
                 try:
-                    _ventas_light(_c, str(_desde_1a.date()), str(_hasta_hist.date()))
-                    _cargar_rango(_c, _d30, pd.Timestamp(_hoy), True)
+                    _cargar_rango(_c, _desde_1a, _hoy, True)   # 1 año completo
+                    _historico_cliente(_c, True)               # 24 meses (MoM/YoY)
                 except Exception as e:
                     st.warning(f"{_c}: {e}")
                 _prog.progress((_i + 1) / _n, text=f"{_c} listo ({_i + 1}/{_n})")
             _prog.empty()
-            st.success("Caché pre-cargada ✅")
+            st.success("Histórico pre-cargado ✅" if _store_ok else "Caché temporal lista ✅")
 
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
