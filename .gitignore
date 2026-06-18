@@ -13,3 +13,4 @@ data/*.parquet
 
 # Entorno
 .env
+secrets.toml
