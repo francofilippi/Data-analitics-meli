@@ -80,8 +80,8 @@ def fetch_orders(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
             params={
                 "seller": client.seller_id,
                 "order.status": status,
-                "date_created.from": _iso(desde),
-                "date_created.to": _iso(hasta, eod=True),
+                "order.date_created.from": _iso(desde),
+                "order.date_created.to": _iso(hasta, eod=True),
                 "sort": "date_asc",
             },
         )

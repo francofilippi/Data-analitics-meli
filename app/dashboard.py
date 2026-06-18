@@ -55,7 +55,9 @@ def _ml_client(nombre: str):
 # --------------------------------------------------------------------------- #
 from datetime import date as _date, timedelta as _td
 
-_DISK_CACHE = Path("/tmp/ml_dash_cache")
+# v2: el filtro de fechas de /orders/search estaba mal (faltaba prefijo
+# "order."), así que el cache v1 quedó con datos de todo el año. Bump → ignora v1.
+_DISK_CACHE = Path("/tmp/ml_dash_cache_v2")
 
 
 def _pk(nombre: str, tag: str, kind: str) -> Path:
