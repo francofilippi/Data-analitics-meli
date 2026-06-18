@@ -27,7 +27,7 @@ CAMPANAS: list[tuple[str, pd.Timestamp, pd.Timestamp]] = [
 # Carga                                                                        #
 # --------------------------------------------------------------------------- #
 def cargar_datos() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Lee los CSV. Si no existen los genera al vuelo (primer deploy)."""
+    """Lee los CSV sintéticos. Si no existen los genera al vuelo."""
     if not (DATA_DIR / "ventas.csv").exists():
         from data import generar_datos
         generar_datos.main()
@@ -35,6 +35,48 @@ def cargar_datos() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     visitas = pd.read_csv(DATA_DIR / "visitas.csv", parse_dates=["fecha"])
     preguntas = pd.read_csv(DATA_DIR / "preguntas.csv", parse_dates=["fecha"])
     return ventas, visitas, preguntas
+
+
+def clientes_configurados(secrets: dict | None = None) -> list[str]:
+    """
+    Devuelve la lista de clientes con credenciales ML configuradas en secrets.
+    Si no hay secrets, devuelve los clientes del dataset sintético.
+    """
+    if secrets is None:
+        return sorted(
+            pd.read_csv(DATA_DIR / "ventas.csv")["cliente_ml"].unique().tolist()
+            if (DATA_DIR / "ventas.csv").exists()
+            else ["tienda_norte", "deco_hogar", "tech_outlet"]
+        )
+    # Detectar secciones [ml_{nombre}] en secrets
+    return [k[3:] for k in secrets.keys() if k.startswith("ml_")]
+
+
+def cargar_datos_cliente(
+    nombre: str,
+    desde: pd.Timestamp,
+    hasta: pd.Timestamp,
+    ml_client=None,  # MLClient | None
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Carga datos de UN cliente para el rango desde..hasta.
+
+    Si ml_client es None → usa los CSV sintéticos filtrados.
+    Si ml_client es un MLClient → llama a la API real de ML.
+
+    Esta separación permite usar el mismo dashboard con datos reales o
+    sintéticos sin cambiar ninguna otra función de metricas.py.
+    """
+    if ml_client is not None:
+        from src.ml_fetch import fetch_all
+        return fetch_all(ml_client, desde.date(), hasta.date())
+
+    # Fallback sintético
+    ventas, visitas, preguntas = cargar_datos()
+    v = filtrar(ventas, nombre, desde, hasta)
+    vis = filtrar(visitas, nombre, desde, hasta)
+    preg = filtrar(preguntas, nombre, desde, hasta)
+    return v, vis, preg
 
 
 # --------------------------------------------------------------------------- #

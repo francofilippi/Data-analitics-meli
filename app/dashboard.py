@@ -26,12 +26,48 @@ from src import metricas  # noqa: E402
 st.set_page_config(page_title="Dashboard Mercado Libre", page_icon="📊", layout="wide")
 
 
+# --------------------------------------------------------------------------- #
+# Configuración de clientes ML                                                 #
+# --------------------------------------------------------------------------- #
+def _ml_client(nombre: str):
+    """
+    Construye un MLClient desde Streamlit secrets si están configurados.
+    Devuelve None si no hay secrets ML para ese cliente (usa datos sintéticos).
+    """
+    try:
+        sec = st.secrets.get(f"ml_{nombre}")
+        if sec:
+            from src.ml_client import from_secrets
+            key = f"ml_client_{nombre}"
+            # Reusar el cliente de session_state para no re-refreshar el token
+            # en cada rerun de Streamlit (cada interacción recorre el script entero).
+            if key not in st.session_state:
+                st.session_state[key] = from_secrets(nombre, sec)
+            return st.session_state[key]
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner="Cargando datos de Mercado Libre…")
+def _datos_cliente(nombre: str, desde: str, hasta: str, usar_ml: bool):
+    """
+    Cache por (cliente, desde, hasta, fuente). TTL 1 hora para datos reales.
+    Las fechas entran como string para que sean hashables por el cache.
+
+    Lección de DS: siempre cachear las llamadas a APIs externas. Sin cache,
+    cada click en el dashboard haría decenas de llamadas a ML — lento y costoso.
+    """
+    d = pd.Timestamp(desde)
+    h = pd.Timestamp(hasta)
+    client = _ml_client(nombre) if usar_ml else None
+    return metricas.cargar_datos_cliente(nombre, d, h, client)
+
+
+# Datos sintéticos para saber qué clientes hay cuando no hay ML configurado
 @st.cache_data
-def _datos():
+def _sinteticos():
     return metricas.cargar_datos()
-
-
-ventas, visitas, preguntas = _datos()
 
 # --------------------------------------------------------------------------- #
 # Autenticacion por token en la URL                                            #
@@ -67,7 +103,16 @@ except Exception:
 # Sidebar                                                                      #
 # --------------------------------------------------------------------------- #
 st.sidebar.title("📊 Mercado Libre")
-clientes = sorted(ventas["cliente_ml"].unique())
+
+# Determinar lista de clientes disponibles
+_v_sint, _, _ = _sinteticos()
+_clientes_sint = sorted(_v_sint["cliente_ml"].unique().tolist())
+try:
+    _clientes_ml = metricas.clientes_configurados(dict(st.secrets))
+except Exception:
+    _clientes_ml = []
+clientes = _clientes_ml if _clientes_ml else _clientes_sint
+
 if locked_cliente:
     cliente = locked_cliente
     st.sidebar.markdown(f"**Cuenta:** {cliente}")
@@ -77,8 +122,9 @@ else:
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
 
-hasta_max = pd.Timestamp(ventas["fecha"].max())
-desde_min = pd.Timestamp(ventas["fecha"].min())
+from datetime import date as _date, timedelta as _td
+hasta_max = pd.Timestamp(_date.today())
+desde_min = pd.Timestamp(_date.today() - _td(days=364))
 
 if PRESETS[preset] is not None:
     dias = PRESETS[preset]
@@ -100,12 +146,13 @@ else:
 desde_prev = desde - pd.Timedelta(days=dias)
 hasta_prev = desde - pd.Timedelta(days=1)
 
-# Datos filtrados
-v_act = metricas.filtrar(ventas, cliente, desde, hasta)
-vis_act = metricas.filtrar(visitas, cliente, desde, hasta)
-preg_act = metricas.filtrar(preguntas, cliente, desde, hasta)
-v_prev = metricas.filtrar(ventas, cliente, desde_prev, hasta_prev)
-vis_prev = metricas.filtrar(visitas, cliente, desde_prev, hasta_prev)
+# Datos filtrados — ML real si hay secrets [ml_{cliente}], sintético si no.
+_usar_ml = bool(_ml_client(cliente))
+v_act, vis_act, preg_act = _datos_cliente(cliente, str(desde.date()), str(hasta.date()), _usar_ml)
+v_prev, vis_prev, _ = _datos_cliente(cliente, str(desde_prev.date()), str(hasta_prev.date()), _usar_ml)
+
+if _usar_ml:
+    st.sidebar.success("✅ Datos reales de ML")
 
 kpi = metricas.kpis_periodo(v_act, vis_act)
 kpi_prev = metricas.kpis_periodo(v_prev, vis_prev)
