@@ -25,7 +25,16 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 # 1. Carga                                                                     #
 # --------------------------------------------------------------------------- #
 def cargar_datos() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Lee los CSV y convierte 'fecha' a tipo fecha real (no texto)."""
+    """
+    Lee los CSV y convierte 'fecha' a tipo fecha real (no texto).
+
+    Si los CSV no existen (ej: primera vez, o en un deploy donde los datos estan
+    gitignoreados), los genera al vuelo. Asi el dashboard "simplemente funciona"
+    sin tener que correr el generador a mano.
+    """
+    if not (DATA_DIR / "ventas.csv").exists():
+        from data import generar_datos
+        generar_datos.main()
     ventas = pd.read_csv(DATA_DIR / "ventas.csv", parse_dates=["fecha"])
     visitas = pd.read_csv(DATA_DIR / "visitas.csv", parse_dates=["fecha"])
     return ventas, visitas

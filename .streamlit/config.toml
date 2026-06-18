@@ -1,0 +1,8 @@
+# Configuracion de Streamlit para deploy.
+[server]
+headless = true
+enableCORS = false
+
+[theme]
+primaryColor = "#2563eb"
+base = "light"
