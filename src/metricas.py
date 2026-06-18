@@ -37,10 +37,26 @@ def cargar_datos() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     return ventas, visitas, preguntas
 
 
+_ML_CRED_KEYS = {"client_id", "client_secret", "access_token", "refresh_token"}
+
+
+def _es_seccion_ml(valor) -> bool:
+    """True si una sección de secrets parece un bloque de credenciales ML."""
+    try:
+        claves = set(dict(valor).keys())
+    except Exception:
+        return False
+    # Requiere al menos client_id + access_token para considerarse seller ML
+    return {"client_id", "access_token"}.issubset(claves)
+
+
 def clientes_configurados(secrets: dict | None = None) -> list[str]:
     """
-    Devuelve la lista de clientes con credenciales ML configuradas en secrets.
-    Si no hay secrets, devuelve los clientes del dataset sintético.
+    Devuelve la lista de sellers con credenciales ML configuradas en secrets.
+
+    Detecta CUALQUIER sección que contenga credenciales ML (client_id +
+    access_token), sin importar cómo se llame. Acepta tanto [ml_seller] como
+    [SELLER] directamente. Excluye [tokens] y otras secciones de config.
     """
     if secrets is None:
         return sorted(
@@ -48,8 +64,14 @@ def clientes_configurados(secrets: dict | None = None) -> list[str]:
             if (DATA_DIR / "ventas.csv").exists()
             else ["tienda_norte", "deco_hogar", "tech_outlet"]
         )
-    # Detectar secciones [ml_{nombre}] en secrets
-    return [k[3:] for k in secrets.keys() if k.startswith("ml_")]
+    nombres = []
+    for k, v in secrets.items():
+        if k == "tokens":
+            continue
+        if _es_seccion_ml(v):
+            # Quitar prefijo ml_ si lo tiene, para mostrar nombre limpio
+            nombres.append(k[3:] if k.startswith("ml_") else k)
+    return sorted(nombres)
 
 
 def cargar_datos_cliente(

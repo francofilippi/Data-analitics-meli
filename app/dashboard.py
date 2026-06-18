@@ -35,7 +35,8 @@ def _ml_client(nombre: str):
     Devuelve None si no hay secrets ML para ese cliente (usa datos sintéticos).
     """
     try:
-        sec = st.secrets.get(f"ml_{nombre}")
+        # La sección puede llamarse [nombre] o [ml_nombre]
+        sec = st.secrets.get(nombre) or st.secrets.get(f"ml_{nombre}")
         if sec:
             from src.ml_client import from_secrets
             key = f"ml_client_{nombre}"
