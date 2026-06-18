@@ -1,21 +1,10 @@
 """
 Generador de datos sinteticos de Mercado Libre.
 
-Por que sinteticos: para aprender data science necesitamos datos YA, sin pelear
-con credenciales de la API. Estos datos imitan la forma de lo que despues va a
-devolver la API real de ML (ordenes + visitas), asi el resto del codigo
-(metricas, dashboard) no cambia cuando enchufemos datos reales.
-
-Genera dos tablas (los dos "datasets" base de cualquier analisis de e-commerce):
-
-  1. ventas.csv  -> una fila por linea de orden (que se vendio, cuanto, a quien)
-  2. visitas.csv -> visitas diarias por publicacion (el "trafico" del negocio)
-
-Con esas dos tablas se calcula casi todo: ingresos, ticket promedio, unidades,
-y la metrica reina del e-commerce -> tasa de conversion = ventas / visitas.
-
-Uso:
-    python data/generar_datos.py
+Genera tres tablas:
+  ventas.csv   — una fila por linea de orden
+  visitas.csv  — visitas diarias por publicacion
+  preguntas.csv — preguntas diarias por publicacion (parte del embudo)
 """
 
 from __future__ import annotations
@@ -28,47 +17,41 @@ import numpy as np
 import pandas as pd
 from faker import Faker
 
-# Semilla fija = resultados reproducibles. En DS esto importa: que el analisis
-# de errores el mismo dataset cada vez que corres el script.
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
-fake = Faker("es_AR")
 Faker.seed(SEED)
 
 DATA_DIR = Path(__file__).parent
-DIAS_DE_HISTORIA = 365  # un anio para poder comparar meses y ver estacionalidad
+DIAS_DE_HISTORIA = 365
 
-# Varios "clientes" (cuentas de ML). El dashboard sera multi-cliente: cada uno
-# entra a su link y ve SOLO sus datos. Por eso todo lleva una columna cliente_ml.
 CLIENTES = ["tienda_norte", "deco_hogar", "tech_outlet"]
 
-# Catalogo de productos por cliente. categoria + precio_base + popularidad.
-# popularidad pondera cuanto se vende cada item (productos "estrella" vs cola larga).
+# (titulo, categoria, precio_base, popularidad, marca)
 CATALOGO = {
     "tienda_norte": [
-        ("Zapatillas Running Pro", "Calzado", 85000, 5),
-        ("Campera Inflable", "Indumentaria", 62000, 3),
-        ("Mochila Urbana 25L", "Accesorios", 38000, 4),
-        ("Remera Algodon Premium", "Indumentaria", 18000, 6),
-        ("Medias Pack x3", "Indumentaria", 9000, 8),
-        ("Gorra Trucker", "Accesorios", 12000, 2),
+        ("Zapatillas Running Pro", "Calzado", 85000, 5, "Nike"),
+        ("Campera Inflable", "Indumentaria", 62000, 3, "The North Face"),
+        ("Mochila Urbana 25L", "Accesorios", 38000, 4, "Quechua"),
+        ("Remera Algodon Premium", "Indumentaria", 18000, 6, "Adidas"),
+        ("Medias Pack x3", "Indumentaria", 9000, 8, "Adidas"),
+        ("Gorra Trucker", "Accesorios", 12000, 2, "Nike"),
     ],
     "deco_hogar": [
-        ("Lampara de Pie Nordica", "Iluminacion", 95000, 3),
-        ("Juego de Sabanas Queen", "Textil", 54000, 5),
-        ("Cuadro Decorativo 60x90", "Decoracion", 28000, 4),
-        ("Organizador Modular", "Organizacion", 33000, 6),
-        ("Vela Aromatica Set", "Decoracion", 14000, 7),
-        ("Espejo Redondo 50cm", "Decoracion", 41000, 2),
+        ("Lampara de Pie Nordica", "Iluminacion", 95000, 3, "Loft"),
+        ("Juego de Sabanas Queen", "Textil", 54000, 5, "Cannon"),
+        ("Cuadro Decorativo 60x90", "Decoracion", 28000, 4, "Maisons"),
+        ("Organizador Modular", "Organizacion", 33000, 6, "Loft"),
+        ("Vela Aromatica Set", "Decoracion", 14000, 7, "Maisons"),
+        ("Espejo Redondo 50cm", "Decoracion", 41000, 2, "Cannon"),
     ],
     "tech_outlet": [
-        ("Auriculares Bluetooth", "Audio", 72000, 6),
-        ("Cargador USB-C 65W", "Accesorios", 25000, 7),
-        ("Mouse Gamer RGB", "Perifericos", 38000, 5),
-        ("Teclado Mecanico", "Perifericos", 89000, 3),
-        ("Webcam Full HD", "Perifericos", 56000, 2),
-        ("Hub USB 7 Puertos", "Accesorios", 31000, 4),
+        ("Auriculares Bluetooth", "Audio", 72000, 6, "Sony"),
+        ("Cargador USB-C 65W", "Accesorios", 25000, 7, "Samsung"),
+        ("Mouse Gamer RGB", "Perifericos", 38000, 5, "Logitech"),
+        ("Teclado Mecanico", "Perifericos", 89000, 3, "Logitech"),
+        ("Webcam Full HD", "Perifericos", 56000, 2, "Sony"),
+        ("Hub USB 7 Puertos", "Accesorios", 31000, 4, "Kingston"),
     ],
 }
 
@@ -78,67 +61,79 @@ PROVINCIAS = [
     ("Otras", 0.08),
 ]
 
+MEDIOS_ENTREGA = [
+    ("MercadoEnvios2", 0.50),
+    ("Full", 0.25),
+    ("Flex", 0.20),
+    ("Retiro en local", 0.05),
+]
+
 TIPO_PUBLICACION = [("clasica", 0.55), ("premium", 0.45)]
-# La comision de ML depende del tipo: premium cobra mas pero da cuotas sin interes.
 COMISION_PCT = {"clasica": 0.13, "premium": 0.18}
+
+# Picos de campanas: (inicio, fin, multiplicador de demanda)
+CAMPANAS_BOOST: list[tuple[date, date, float]] = [
+    (date(2025, 11, 3), date(2025, 11, 5), 2.5),   # CyberMonday
+    (date(2025, 12, 24), date(2025, 12, 26), 1.8),  # Navidad
+    (date(2026, 2, 14), date(2026, 2, 14), 1.5),    # Dia Enamorados
+    (date(2026, 5, 11), date(2026, 5, 13), 2.2),    # Hot Sale
+]
 
 
 def _elegir_ponderado(opciones: list[tuple]) -> str:
-    """Elige una opcion segun su peso. opciones = [(valor, peso), ...]."""
-    valores = [o[0] for o in opciones]
-    pesos = [o[1] for o in opciones]
-    return random.choices(valores, weights=pesos, k=1)[0]
+    return random.choices([o[0] for o in opciones], weights=[o[1] for o in opciones], k=1)[0]
 
 
-def _factor_estacional(dia: date) -> float:
-    """
-    Multiplicador de demanda segun el dia. Imita patrones reales:
-    - Fin de semana vende mas que dias de semana.
-    - Hay un pico en noviembre (Black Friday / CyberMonday).
-    - Leve crecimiento a lo largo del anio (el negocio crece).
-    """
+def _factor_estacional(dia: date, inicio: date) -> float:
     factor = 1.0
-    if dia.weekday() >= 5:           # sabado / domingo
+    if dia.weekday() >= 5:
         factor *= 1.35
-    if dia.month == 11:              # temporada alta
+    if dia.month == 11:
         factor *= 1.8
-    if dia.month in (1, 2):          # verano, baja el consumo
+    if dia.month in (1, 2):
         factor *= 0.8
-    # tendencia: cada dia transcurrido suma un poquito (negocio en crecimiento)
-    dias_desde_inicio = (dia - (date.today() - timedelta(days=DIAS_DE_HISTORIA))).days
-    factor *= 1 + (dias_desde_inicio / DIAS_DE_HISTORIA) * 0.4
+    dias_transcurridos = (dia - inicio).days
+    factor *= 1 + (dias_transcurridos / DIAS_DE_HISTORIA) * 0.4
+    for c_ini, c_fin, boost in CAMPANAS_BOOST:
+        if c_ini <= dia <= c_fin:
+            factor *= boost
+            break
     return factor
 
 
-def generar() -> tuple[pd.DataFrame, pd.DataFrame]:
+def generar() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     filas_ventas: list[dict] = []
     filas_visitas: list[dict] = []
+    filas_preguntas: list[dict] = []
     order_id = 1000
-
     inicio = date.today() - timedelta(days=DIAS_DE_HISTORIA)
 
     for offset in range(DIAS_DE_HISTORIA):
         dia = inicio + timedelta(days=offset)
-        estacional = _factor_estacional(dia)
+        estacional = _factor_estacional(dia, inicio)
 
         for cliente in CLIENTES:
-            for titulo, categoria, precio_base, popularidad in CATALOGO[cliente]:
-                # --- VISITAS del dia para esta publicacion ---
-                # base proporcional a la popularidad, con ruido aleatorio (Poisson
-                # modela bien conteos de eventos como visitas).
+            for titulo, categoria, precio_base, popularidad, marca in CATALOGO[cliente]:
+                item_id = f"MLA{abs(hash((cliente, titulo))) % 900000 + 100000}"
+
                 visitas_base = popularidad * 18 * estacional
                 visitas = int(np.random.poisson(visitas_base))
                 filas_visitas.append({
-                    "fecha": dia,
-                    "cliente_ml": cliente,
-                    "item_id": f"MLA{abs(hash((cliente, titulo))) % 900000 + 100000}",
-                    "titulo": titulo,
-                    "categoria": categoria,
+                    "fecha": dia, "cliente_ml": cliente,
+                    "item_id": item_id, "titulo": titulo,
+                    "categoria": categoria, "marca": marca,
                     "visitas": visitas,
                 })
 
-                # --- VENTAS: cada visita convierte con cierta probabilidad ---
-                # tasa de conversion realista de ML: ~2% a 6% segun el item.
+                # Preguntas: ~12% de las visitas generan una pregunta.
+                # Si hay muchas preguntas y pocas ventas = friccion de info.
+                preguntas = int(np.random.binomial(visitas, 0.12))
+                filas_preguntas.append({
+                    "fecha": dia, "cliente_ml": cliente,
+                    "item_id": item_id, "titulo": titulo,
+                    "preguntas": preguntas,
+                })
+
                 tasa_conv = 0.02 + (popularidad / 200)
                 ordenes_hoy = np.random.binomial(visitas, tasa_conv)
 
@@ -146,21 +141,19 @@ def generar() -> tuple[pd.DataFrame, pd.DataFrame]:
                     order_id += 1
                     tipo = _elegir_ponderado(TIPO_PUBLICACION)
                     unidades = random.choices([1, 2, 3], weights=[0.8, 0.15, 0.05])[0]
-                    # variacion de precio +/-5% (promos, descuentos)
                     precio = round(precio_base * random.uniform(0.95, 1.05), -2)
                     ingreso = precio * unidades
-                    # 4% de las ordenes terminan canceladas/devueltas
-                    estado = random.choices(
-                        ["pagado", "cancelado"], weights=[0.96, 0.04]
-                    )[0]
+                    estado = random.choices(["pagado", "cancelado"], weights=[0.96, 0.04])[0]
                     filas_ventas.append({
                         "order_id": order_id,
                         "fecha": dia,
                         "cliente_ml": cliente,
-                        "item_id": f"MLA{abs(hash((cliente, titulo))) % 900000 + 100000}",
+                        "item_id": item_id,
                         "titulo": titulo,
                         "categoria": categoria,
+                        "marca": marca,
                         "tipo_publicacion": tipo,
+                        "medio_entrega": _elegir_ponderado(MEDIOS_ENTREGA),
                         "unidades": unidades,
                         "precio_unitario": precio,
                         "ingreso": ingreso,
@@ -170,20 +163,18 @@ def generar() -> tuple[pd.DataFrame, pd.DataFrame]:
                         "estado": estado,
                     })
 
-    ventas = pd.DataFrame(filas_ventas)
-    visitas = pd.DataFrame(filas_visitas)
-    return ventas, visitas
+    return pd.DataFrame(filas_ventas), pd.DataFrame(filas_visitas), pd.DataFrame(filas_preguntas)
 
 
 def main() -> None:
-    ventas, visitas = generar()
+    ventas, visitas, preguntas = generar()
     DATA_DIR.mkdir(exist_ok=True)
     ventas.to_csv(DATA_DIR / "ventas.csv", index=False)
     visitas.to_csv(DATA_DIR / "visitas.csv", index=False)
-    print(f"OK -> {len(ventas):,} ventas y {len(visitas):,} filas de visitas")
-    print(f"   clientes: {', '.join(CLIENTES)}")
+    preguntas.to_csv(DATA_DIR / "preguntas.csv", index=False)
+    print(f"OK -> {len(ventas):,} ventas | {len(visitas):,} visitas | {len(preguntas):,} preguntas")
     print(f"   periodo: {ventas['fecha'].min()} a {ventas['fecha'].max()}")
-    print(f"   ingreso total simulado: ${ventas['ingreso'].sum():,.0f}")
+    print(f"   GMV total: ${ventas[ventas['estado']=='pagado']['ingreso'].sum():,.0f}")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,9 @@
 """
-Metricas del negocio: aca vive el "data science".
+Metricas del negocio.
 
-Cada funcion toma un DataFrame de pandas y devuelve un numero, una serie o una
-tabla agregada. El dashboard (app/dashboard.py) solo llama estas funciones y
-dibuja el resultado: separar el CALCULO de la VISUALIZACION es la regla de oro
-para que el codigo se entienda y se pueda testear.
-
-Conceptos de pandas que vas a ver repetidos aca:
-  - filtrado booleano:   df[df["col"] == valor]
-  - agregacion:          df.groupby("col")["otra"].sum()
-  - series temporales:   df.resample("D" / "ME", on="fecha")
+Regla: este modulo SOLO calcula — devuelve numeros, DataFrames, dicts.
+El dashboard (app/dashboard.py) dibuja los resultados.
+Separar calculo de visualizacion permite testear los numeros sin levantar la web.
 """
 
 from __future__ import annotations
@@ -20,28 +14,31 @@ import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
+# Campanas para shading en graficos. Importadas desde dashboard.py.
+CAMPANAS: list[tuple[str, pd.Timestamp, pd.Timestamp]] = [
+    ("CyberMonday", pd.Timestamp("2025-11-03"), pd.Timestamp("2025-11-05")),
+    ("Navidad", pd.Timestamp("2025-12-24"), pd.Timestamp("2025-12-26")),
+    ("Enamorados", pd.Timestamp("2026-02-14"), pd.Timestamp("2026-02-14")),
+    ("Hot Sale", pd.Timestamp("2026-05-11"), pd.Timestamp("2026-05-13")),
+]
+
 
 # --------------------------------------------------------------------------- #
-# 1. Carga                                                                     #
+# Carga                                                                        #
 # --------------------------------------------------------------------------- #
-def cargar_datos() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Lee los CSV y convierte 'fecha' a tipo fecha real (no texto).
-
-    Si los CSV no existen (ej: primera vez, o en un deploy donde los datos estan
-    gitignoreados), los genera al vuelo. Asi el dashboard "simplemente funciona"
-    sin tener que correr el generador a mano.
-    """
+def cargar_datos() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Lee los CSV. Si no existen los genera al vuelo (primer deploy)."""
     if not (DATA_DIR / "ventas.csv").exists():
         from data import generar_datos
         generar_datos.main()
     ventas = pd.read_csv(DATA_DIR / "ventas.csv", parse_dates=["fecha"])
     visitas = pd.read_csv(DATA_DIR / "visitas.csv", parse_dates=["fecha"])
-    return ventas, visitas
+    preguntas = pd.read_csv(DATA_DIR / "preguntas.csv", parse_dates=["fecha"])
+    return ventas, visitas, preguntas
 
 
 # --------------------------------------------------------------------------- #
-# 2. Filtros (por cliente y por rango de fechas)                               #
+# Filtros                                                                      #
 # --------------------------------------------------------------------------- #
 def filtrar(
     df: pd.DataFrame,
@@ -49,8 +46,7 @@ def filtrar(
     desde: pd.Timestamp | None = None,
     hasta: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    """Devuelve un subconjunto del df. None en un parametro = no filtra por eso."""
-    m = pd.Series(True, index=df.index)  # mascara que arranca toda en True
+    m = pd.Series(True, index=df.index)
     if cliente:
         m &= df["cliente_ml"] == cliente
     if desde is not None:
@@ -61,71 +57,56 @@ def filtrar(
 
 
 def solo_pagadas(ventas: pd.DataFrame) -> pd.DataFrame:
-    """Para ingresos reales se cuentan solo ordenes 'pagado' (no canceladas)."""
     return ventas[ventas["estado"] == "pagado"]
 
 
 # --------------------------------------------------------------------------- #
-# 3. KPIs del periodo (los numeros grandes de las tarjetas)                    #
+# KPIs del periodo                                                             #
 # --------------------------------------------------------------------------- #
 def kpis_periodo(ventas: pd.DataFrame, visitas: pd.DataFrame) -> dict:
-    """
-    Calcula los indicadores clave de un periodo ya filtrado.
-
-    Tasa de conversion = ordenes / visitas. Es la metrica reina del e-commerce:
-    de cada 100 personas que entran a ver, cuantas compran.
-    """
     pagadas = solo_pagadas(ventas)
     ingreso = pagadas["ingreso"].sum()
     unidades = pagadas["unidades"].sum()
     ordenes = len(pagadas)
     total_visitas = visitas["visitas"].sum()
-
     return {
         "ingreso": float(ingreso),
         "unidades": int(unidades),
         "ordenes": ordenes,
-        # ticket promedio = cuanto deja en promedio cada orden
         "ticket_promedio": float(ingreso / ordenes) if ordenes else 0.0,
         "visitas": int(total_visitas),
         "conversion": float(ordenes / total_visitas * 100) if total_visitas else 0.0,
         "comisiones": float(pagadas["comision_ml"].sum()),
-        # cancelaciones: salud de la operacion
-        "tasa_cancelacion": (
-            float((ventas["estado"] == "cancelado").mean() * 100) if len(ventas) else 0.0
-        ),
+        "tasa_cancelacion": float((ventas["estado"] == "cancelado").mean() * 100) if len(ventas) else 0.0,
     }
 
 
 def variacion_pct(actual: float, anterior: float) -> float | None:
-    """
-    Cuanto crecio/cayo un KPI vs el periodo anterior, en %.
-    None cuando no hay base de comparacion (periodo anterior en cero).
-    """
     if anterior == 0:
         return None
     return round((actual - anterior) / anterior * 100, 1)
 
 
 # --------------------------------------------------------------------------- #
-# 4. Series temporales (para los graficos de tendencia)                        #
+# Series temporales                                                            #
 # --------------------------------------------------------------------------- #
 def serie_diaria(ventas: pd.DataFrame) -> pd.DataFrame:
-    """Ingreso y ordenes por dia. resample('D') agrupa por dia calendario."""
     pagadas = solo_pagadas(ventas)
-    s = (
+    return (
         pagadas.resample("D", on="fecha")
-        .agg(ingreso=("ingreso", "sum"), ordenes=("order_id", "count"))
+        .agg(ingreso=("ingreso", "sum"), unidades=("unidades", "sum"), ordenes=("order_id", "count"))
         .reset_index()
     )
+
+
+def serie_con_ma(ventas: pd.DataFrame, window: int = 7) -> pd.DataFrame:
+    """Serie diaria de GMV + media movil para suavizar el ruido."""
+    s = serie_diaria(ventas)
+    s["ma7"] = s["ingreso"].rolling(window, min_periods=1).mean()
     return s
 
 
 def serie_mensual(ventas: pd.DataFrame) -> pd.DataFrame:
-    """
-    Lo mismo pero por mes ('ME' = month end). Sirve para 'comparar varios
-    periodos mensuales' y ver estacionalidad (ej: el pico de noviembre).
-    """
     pagadas = solo_pagadas(ventas)
     s = (
         pagadas.resample("ME", on="fecha")
@@ -136,37 +117,186 @@ def serie_mensual(ventas: pd.DataFrame) -> pd.DataFrame:
     return s
 
 
+def gmv_por_marca_tiempo(ventas: pd.DataFrame) -> pd.DataFrame:
+    """GMV diario por marca, para el area chart apilado."""
+    pagadas = solo_pagadas(ventas)
+    return (
+        pagadas.groupby(["fecha", "marca"])["ingreso"]
+        .sum()
+        .reset_index()
+    )
+
+
+def ticket_diario(ventas: pd.DataFrame) -> pd.DataFrame:
+    """Ticket promedio por dia, para la linea superpuesta en el area chart."""
+    pagadas = solo_pagadas(ventas)
+    s = (
+        pagadas.resample("D", on="fecha")
+        .agg(ingreso=("ingreso", "sum"), ordenes=("order_id", "count"))
+        .reset_index()
+    )
+    s["ticket"] = (s["ingreso"] / s["ordenes"].replace(0, float("nan"))).round(0)
+    return s
+
+
 # --------------------------------------------------------------------------- #
-# 5. Rankings y cortes (group by)                                              #
+# MoM y YoY                                                                   #
+# --------------------------------------------------------------------------- #
+def mom_yoy(ventas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tabla mensual con variacion MoM y YoY.
+
+    MoM (month-over-month): compara cada mes con el mes anterior.
+    YoY (year-over-year): compara cada mes con el mismo mes del anio anterior.
+    YoY es el que elimina la estacionalidad: si noviembre siempre pega,
+    el YoY te dice si creciste ADEMAS del efecto estacional.
+    """
+    mensual = serie_mensual(ventas).copy()
+    mensual["mom_pct"] = mensual["ingreso"].pct_change() * 100
+
+    # Para YoY: unir con la misma tabla desplazada un anio
+    base = mensual[["fecha", "ingreso"]].copy()
+    base["fecha_prev"] = base["fecha"] + pd.DateOffset(years=1)
+    yoy_map = base.set_index("fecha_prev")["ingreso"].rename("ingreso_prev_year")
+    mensual = mensual.join(yoy_map, on="fecha")
+    mensual["yoy_pct"] = (mensual["ingreso"] / mensual["ingreso_prev_year"] - 1) * 100
+
+    mensual["mes_label"] = mensual["fecha"].dt.strftime("%b %Y")
+    return mensual[["mes_label", "fecha", "ingreso", "ordenes", "mom_pct", "yoy_pct"]].sort_values("fecha")
+
+
+# --------------------------------------------------------------------------- #
+# Ritmo por SKU                                                                #
+# --------------------------------------------------------------------------- #
+def velocidad_sku(ventas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Unidades vendidas por dia por SKU.
+    Util para detectar 'estrellas en ascenso' y 'productos que se detienen'.
+    """
+    pagadas = solo_pagadas(ventas)
+    periodo_dias = max(1, (pagadas["fecha"].max() - pagadas["fecha"].min()).days + 1)
+    t = (
+        pagadas.groupby(["titulo", "marca", "categoria"])
+        .agg(unidades=("unidades", "sum"), ingreso=("ingreso", "sum"))
+        .reset_index()
+    )
+    t["unidades_dia"] = (t["unidades"] / periodo_dias).round(2)
+    return t.sort_values("unidades_dia", ascending=False)
+
+
+# --------------------------------------------------------------------------- #
+# Rankings                                                                     #
 # --------------------------------------------------------------------------- #
 def top_productos(ventas: pd.DataFrame, n: int = 10) -> pd.DataFrame:
-    """Top N productos por ingreso. El clasico groupby + sort + head."""
     pagadas = solo_pagadas(ventas)
-    t = (
+    return (
         pagadas.groupby("titulo")
         .agg(ingreso=("ingreso", "sum"), unidades=("unidades", "sum"))
         .sort_values("ingreso", ascending=False)
         .head(n)
         .reset_index()
     )
-    return t
 
 
 def por_categoria(ventas: pd.DataFrame) -> pd.DataFrame:
-    pagadas = solo_pagadas(ventas)
     return (
-        pagadas.groupby("categoria")["ingreso"]
-        .sum()
-        .sort_values(ascending=False)
-        .reset_index()
+        solo_pagadas(ventas).groupby("categoria")["ingreso"]
+        .sum().sort_values(ascending=False).reset_index()
     )
 
 
 def por_provincia(ventas: pd.DataFrame) -> pd.DataFrame:
+    return (
+        solo_pagadas(ventas).groupby("provincia")["ingreso"]
+        .sum().sort_values(ascending=False).reset_index()
+    )
+
+
+def por_medio_entrega(ventas: pd.DataFrame) -> pd.DataFrame:
     pagadas = solo_pagadas(ventas)
     return (
-        pagadas.groupby("provincia")["ingreso"]
+        pagadas.groupby("medio_entrega")
+        .agg(ingreso=("ingreso", "sum"), ordenes=("order_id", "count"), unidades=("unidades", "sum"))
+        .reset_index()
+        .sort_values("ingreso", ascending=False)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Conversion y embudo                                                          #
+# --------------------------------------------------------------------------- #
+def funnel(ventas: pd.DataFrame, visitas: pd.DataFrame, preguntas: pd.DataFrame) -> dict:
+    """
+    Embudo: visitas -> preguntas -> ventas.
+
+    Donde se rompe el embudo te dice que optimizar:
+    - Pocas preguntas / muchas visitas: el titulo/foto no engancha (problema de trafico frio).
+    - Muchas preguntas / pocas ventas: hay friccion informativa (precio, garantia, cuotas).
+      Aca es donde pega el agente de IA.
+    - Pocas visitas / buena conversion: el producto convierte bien pero le falta trafico.
+    """
+    return {
+        "visitas": int(visitas["visitas"].sum()),
+        "preguntas": int(preguntas["preguntas"].sum()),
+        "ventas": int(len(solo_pagadas(ventas))),
+    }
+
+
+def conversion_por_publicacion(ventas: pd.DataFrame, visitas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tasa de conversion (CVR) por item = ordenes / visitas.
+    Fuente principal de la scatter chart.
+    """
+    pagadas = solo_pagadas(ventas)
+    vis_agg = visitas.groupby(["item_id", "titulo", "marca"])["visitas"].sum().reset_index()
+    ven_agg = pagadas.groupby("item_id").agg(
+        ordenes=("order_id", "count"),
+        ingreso=("ingreso", "sum"),
+    ).reset_index()
+    m = vis_agg.merge(ven_agg, on="item_id", how="left").fillna(0)
+    m["conversion"] = (m["ordenes"] / m["visitas"] * 100).where(m["visitas"] > 0, 0.0)
+    return m.sort_values("conversion", ascending=False)
+
+
+# --------------------------------------------------------------------------- #
+# Concentracion / Pareto                                                       #
+# --------------------------------------------------------------------------- #
+def pareto_sku(ventas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Curva de Pareto por SKU.
+
+    La regla 80/20: en la mayoria de los negocios el 20% de los SKUs genera
+    el 80% de la venta. El Pareto te muestra exactamente cuantos SKUs son
+    criticos y cuales son 'cola larga'.
+    Clasificacion ABC:
+      A = primeros SKUs hasta el 70% del GMV (criticos)
+      B = hasta el 90%
+      C = el resto (cola)
+    """
+    pagadas = solo_pagadas(ventas)
+    t = (
+        pagadas.groupby(["titulo", "marca"])["ingreso"]
         .sum()
         .sort_values(ascending=False)
         .reset_index()
+    )
+    total = t["ingreso"].sum()
+    t["pct_acum"] = t["ingreso"].cumsum() / total * 100
+    t["abc"] = pd.cut(t["pct_acum"], bins=[0, 70, 90, 100], labels=["A", "B", "C"], right=True)
+    return t
+
+
+def productos_sin_conversion(ventas: pd.DataFrame, visitas: pd.DataFrame, min_visitas: int = 30) -> pd.DataFrame:
+    """
+    Items con visitas suficientes pero cero ventas pagadas en el periodo.
+    Candidatos a optimizar (precio/foto/titulo) o dar de baja.
+    """
+    pagadas = solo_pagadas(ventas)
+    vis_agg = visitas.groupby(["item_id", "titulo"])["visitas"].sum().reset_index()
+    ven_agg = pagadas.groupby("item_id")["order_id"].count().reset_index(name="ordenes")
+    m = vis_agg.merge(ven_agg, on="item_id", how="left").fillna(0)
+    return (
+        m[(m["visitas"] >= min_visitas) & (m["ordenes"] == 0)]
+        .sort_values("visitas", ascending=False)
+        .reset_index(drop=True)
     )

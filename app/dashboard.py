@@ -1,83 +1,63 @@
 """
-Dashboard interactivo de Mercado Libre (Streamlit).
+Dashboard comercial de Mercado Libre — Streamlit.
 
-Streamlit convierte un script de Python en una web: cada widget (selectbox,
-slider) que el usuario toca vuelve a correr el script de arriba a abajo con el
-nuevo valor. No escribis HTML ni JS: solo Python.
-
-Correr local:
-    streamlit run app/dashboard.py
-
-Este archivo SOLO arma la interfaz y llama a src/metricas.py para los calculos.
-La separacion calculo / vista es a proposito (ver comentario en metricas.py).
+Tabs:
+  Resumen           — KPIs con deltas vs periodo anterior
+  Volumen & Facturacion — GMV+unidades, marca, medio de entrega
+  Ritmo & Tendencia — serie diaria + MA7 + campanas, MoM/YoY
+  Conversion        — embudo, scatter visitas vs CVR
+  Concentracion     — Pareto ABC, productos sin conversion, velocidad SKU
 """
 
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
-# Permite importar src/metricas.py al correr desde la raiz del repo.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src import metricas  # noqa: E402
 
 st.set_page_config(page_title="Dashboard Mercado Libre", page_icon="📊", layout="wide")
 
 
-# @st.cache_data: Streamlit guarda el resultado en memoria y no relee los CSV
-# en cada interaccion. Clave para que el dashboard sea rapido.
 @st.cache_data
 def _datos():
     return metricas.cargar_datos()
 
 
-ventas, visitas = _datos()
+ventas, visitas, preguntas = _datos()
 
 # --------------------------------------------------------------------------- #
-# Sidebar: filtros (cliente + periodo)                                         #
+# Sidebar                                                                      #
 # --------------------------------------------------------------------------- #
 st.sidebar.title("📊 Mercado Libre")
-st.sidebar.caption("Panel de metricas por cliente")
-
 clientes = sorted(ventas["cliente_ml"].unique())
-cliente = st.sidebar.selectbox("Cliente (cuenta ML)", clientes)
+cliente = st.sidebar.selectbox("Cliente", clientes)
 
-PRESETS = {
-    "Ultimos 7 dias": 7,
-    "Ultimos 30 dias": 30,
-    "Ultimos 90 dias": 90,
-    "Ultimo anio": 365,
-}
-preset = st.sidebar.radio("Periodo", list(PRESETS.keys()), index=1)
+PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365}
+preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
 dias = PRESETS[preset]
 
 hasta = pd.Timestamp(ventas["fecha"].max())
 desde = hasta - pd.Timedelta(days=dias - 1)
-# Periodo anterior de igual largo, para calcular las variaciones (deltas).
 desde_prev = desde - pd.Timedelta(days=dias)
 hasta_prev = desde - pd.Timedelta(days=1)
 
-# --------------------------------------------------------------------------- #
-# Filtrado de datos                                                            #
-# --------------------------------------------------------------------------- #
+# Datos filtrados
 v_act = metricas.filtrar(ventas, cliente, desde, hasta)
 vis_act = metricas.filtrar(visitas, cliente, desde, hasta)
+preg_act = metricas.filtrar(preguntas, cliente, desde, hasta)
 v_prev = metricas.filtrar(ventas, cliente, desde_prev, hasta_prev)
 vis_prev = metricas.filtrar(visitas, cliente, desde_prev, hasta_prev)
 
 kpi = metricas.kpis_periodo(v_act, vis_act)
 kpi_prev = metricas.kpis_periodo(v_prev, vis_prev)
-
-# --------------------------------------------------------------------------- #
-# Encabezado + tarjetas de KPIs                                                #
-# --------------------------------------------------------------------------- #
-st.title(f"Resumen de {cliente}")
-st.caption(f"{preset} · {desde.date()} a {hasta.date()} · comparado con el periodo anterior")
 
 
 def _delta(campo: str, sufijo: str = "%") -> str | None:
@@ -85,55 +65,315 @@ def _delta(campo: str, sufijo: str = "%") -> str | None:
     return None if var is None else f"{var:+.1f}{sufijo}"
 
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Ingresos", f"${kpi['ingreso']:,.0f}", _delta("ingreso"))
-c2.metric("Ordenes", f"{kpi['ordenes']:,}", _delta("ordenes"))
-c3.metric("Ticket promedio", f"${kpi['ticket_promedio']:,.0f}", _delta("ticket_promedio"))
-c4.metric("Conversion", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
-
-c5, c6, c7, c8 = st.columns(4)
-c5.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))
-c6.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
-c7.metric("Comisiones ML", f"${kpi['comisiones']:,.0f}", _delta("comisiones"))
-c8.metric("Tasa cancelacion", f"{kpi['tasa_cancelacion']:.1f}%")
-
-st.divider()
-
 # --------------------------------------------------------------------------- #
-# Graficos                                                                     #
+# Tabs                                                                         #
 # --------------------------------------------------------------------------- #
-col_izq, col_der = st.columns([2, 1])
+st.title(f"📈 {cliente}")
+st.caption(f"{preset} · {desde.date()} → {hasta.date()} · vs período anterior")
 
-with col_izq:
-    st.subheader("Ingresos por dia")
-    serie = metricas.serie_diaria(v_act)
-    fig = px.area(serie, x="fecha", y="ingreso", labels={"ingreso": "Ingreso $", "fecha": ""})
-    fig.update_traces(line_color="#2563eb", fillcolor="rgba(37,99,235,0.15)")
-    st.plotly_chart(fig, use_container_width=True)
+tab_res, tab_vol, tab_ritmo, tab_conv, tab_conc = st.tabs([
+    "Resumen", "Volumen & Facturación", "Ritmo & Tendencia", "Conversión", "Concentración"
+])
 
-with col_der:
-    st.subheader("Por categoria")
-    cat = metricas.por_categoria(v_act)
-    fig_cat = px.pie(cat, names="categoria", values="ingreso", hole=0.5)
-    st.plotly_chart(fig_cat, use_container_width=True)
 
-st.subheader("Top productos")
-top = metricas.top_productos(v_act, n=10)
-fig_top = px.bar(
-    top.sort_values("ingreso"),
-    x="ingreso", y="titulo", orientation="h",
-    labels={"ingreso": "Ingreso $", "titulo": ""},
-)
-fig_top.update_traces(marker_color="#16a34a")
-st.plotly_chart(fig_top, use_container_width=True)
+# =================================================================== RESUMEN #
+with tab_res:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("GMV", f"${kpi['ingreso']:,.0f}", _delta("ingreso"))
+    c2.metric("Órdenes", f"{kpi['ordenes']:,}", _delta("ordenes"))
+    c3.metric("Ticket promedio", f"${kpi['ticket_promedio']:,.0f}", _delta("ticket_promedio"))
+    c4.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
 
-# Vista mensual: comparar varios meses (estacionalidad). Usa TODO el historico
-# del cliente, no solo el periodo filtrado, para que se vea la tendencia anual.
-st.subheader("Evolucion mensual (historico completo)")
-mensual = metricas.serie_mensual(metricas.filtrar(ventas, cliente))
-fig_mes = px.bar(mensual, x="mes", y="ingreso", labels={"ingreso": "Ingreso $", "mes": ""})
-fig_mes.update_traces(marker_color="#7c3aed")
-st.plotly_chart(fig_mes, use_container_width=True)
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))
+    c6.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
+    c7.metric("Comisiones ML", f"${kpi['comisiones']:,.0f}", _delta("comisiones"))
+    c8.metric("Cancelaciones", f"{kpi['tasa_cancelacion']:.1f}%")
 
-with st.expander("Ver datos crudos del periodo"):
-    st.dataframe(v_act, use_container_width=True)
+    st.divider()
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        serie = metricas.serie_diaria(v_act)
+        fig = px.area(serie, x="fecha", y="ingreso", labels={"ingreso": "GMV $", "fecha": ""})
+        fig.update_traces(line_color="#2563eb", fillcolor="rgba(37,99,235,0.12)")
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        cat = metricas.por_categoria(v_act)
+        fig_cat = px.pie(cat, names="categoria", values="ingreso", hole=0.5)
+        fig_cat.update_traces(textposition="outside", textinfo="label+percent")
+        st.plotly_chart(fig_cat, use_container_width=True)
+
+
+# ================================================= VOLUMEN & FACTURACION #
+with tab_vol:
+    st.subheader("GMV por marca + Ticket promedio")
+    st.caption(
+        "Las barras apiladas muestran cuánto aporta cada marca al GMV total. "
+        "La línea punteada es el ticket promedio: si sube mientras el GMV baja, "
+        "vendiste menos pero más caro."
+    )
+
+    gmv_marca = metricas.gmv_por_marca_tiempo(v_act)
+    ticket_d = metricas.ticket_diario(v_act)
+
+    if not gmv_marca.empty:
+        pivot = gmv_marca.pivot(index="fecha", columns="marca", values="ingreso").fillna(0).reset_index()
+        marcas = [c for c in pivot.columns if c != "fecha"]
+        colores = px.colors.qualitative.Set2
+
+        fig_stack = make_subplots(specs=[[{"secondary_y": True}]])
+        for i, m in enumerate(marcas):
+            fig_stack.add_trace(
+                go.Scatter(
+                    x=pivot["fecha"], y=pivot[m], name=m,
+                    stackgroup="one", fill="tonexty",
+                    line=dict(color=colores[i % len(colores)], width=0.5),
+                ),
+                secondary_y=False,
+            )
+        fig_stack.add_trace(
+            go.Scatter(
+                x=ticket_d["fecha"], y=ticket_d["ticket"],
+                name="Ticket promedio", mode="lines",
+                line=dict(color="#1e293b", width=2, dash="dot"),
+            ),
+            secondary_y=True,
+        )
+        fig_stack.update_yaxes(title_text="GMV $", secondary_y=False)
+        fig_stack.update_yaxes(title_text="Ticket $ (promedio)", secondary_y=True)
+        fig_stack.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))
+        st.plotly_chart(fig_stack, use_container_width=True)
+
+    st.divider()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Por medio de entrega")
+        me = metricas.por_medio_entrega(v_act)
+        fig_me = px.bar(
+            me, x="medio_entrega", y="ingreso", color="medio_entrega",
+            color_discrete_sequence=px.colors.qualitative.Pastel,
+            labels={"ingreso": "GMV $", "medio_entrega": ""},
+            text_auto=".2s",
+        )
+        fig_me.update_layout(showlegend=False)
+        st.plotly_chart(fig_me, use_container_width=True)
+
+        total_me = me["ingreso"].sum()
+        me["pct"] = (me["ingreso"] / total_me * 100).round(1)
+        st.dataframe(
+            me[["medio_entrega", "ordenes", "unidades", "ingreso", "pct"]]
+            .rename(columns={"medio_entrega": "Medio", "ordenes": "Órdenes",
+                             "unidades": "Unidades", "ingreso": "GMV $", "pct": "%"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    with col2:
+        st.subheader("Top productos — GMV vs Unidades")
+        st.caption("Las barras son GMV; las etiquetas muestran las unidades vendidas.")
+        top = metricas.top_productos(v_act)
+        fig_top = px.bar(
+            top.sort_values("ingreso"),
+            x="ingreso", y="titulo", orientation="h",
+            color="ingreso", color_continuous_scale="Blues",
+            text="unidades",
+            labels={"ingreso": "GMV $", "titulo": ""},
+        )
+        fig_top.update_traces(texttemplate="%{text} u.", textposition="inside")
+        fig_top.update_coloraxes(showscale=False)
+        st.plotly_chart(fig_top, use_container_width=True)
+
+
+# ================================================= RITMO & TENDENCIA #
+with tab_ritmo:
+    st.subheader("Ventas diarias con media móvil 7 días")
+    st.caption(
+        "La línea fina son las ventas reales (ruidosas). La línea gruesa es la media "
+        "móvil de 7 días: suaviza el ruido del día a día y muestra la tendencia real. "
+        "Los sombreados son campañas de ML."
+    )
+
+    serie_ma = metricas.serie_con_ma(v_act)
+
+    fig_ma = go.Figure()
+    fig_ma.add_trace(go.Scatter(
+        x=serie_ma["fecha"], y=serie_ma["ingreso"],
+        name="GMV diario", line=dict(color="#93c5fd", width=1), opacity=0.7,
+    ))
+    fig_ma.add_trace(go.Scatter(
+        x=serie_ma["fecha"], y=serie_ma["ma7"],
+        name="Media móvil 7d", line=dict(color="#2563eb", width=2.5),
+    ))
+
+    # Sombreado de campañas dentro del periodo visible
+    for nombre, ini, fin in metricas.CAMPANAS:
+        if ini <= hasta and fin >= desde:
+            fig_ma.add_vrect(
+                x0=max(ini, desde), x1=min(fin, hasta),
+                fillcolor="#fbbf24", opacity=0.25, line_width=0,
+                annotation_text=nombre, annotation_position="top left",
+            )
+
+    fig_ma.update_layout(
+        yaxis_title="GMV $", xaxis_title="",
+        legend=dict(orientation="h", y=-0.15), margin=dict(t=10),
+    )
+    st.plotly_chart(fig_ma, use_container_width=True)
+
+    st.divider()
+    st.subheader("Comparativa mensual — MoM y YoY")
+    st.caption(
+        "MoM (month-over-month): cuánto creció vs el mes anterior. "
+        "YoY (year-over-year): vs el mismo mes del año pasado — elimina la estacionalidad. "
+        "Si noviembre siempre pega fuerte, el YoY te dice si creciste ADEMÁS del efecto seasonal."
+    )
+
+    mom = metricas.mom_yoy(metricas.filtrar(ventas, cliente))
+    mom_show = mom.copy()
+    mom_show["GMV $"] = mom_show["ingreso"].map("${:,.0f}".format)
+    mom_show["MoM %"] = mom_show["mom_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+    mom_show["YoY %"] = mom_show["yoy_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+
+    st.dataframe(
+        mom_show[["mes_label", "GMV $", "ordenes", "MoM %", "YoY %"]]
+        .rename(columns={"mes_label": "Mes", "ordenes": "Órdenes"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    fig_mom = go.Figure()
+    m_clean = mom.dropna(subset=["mom_pct"])
+    colors_mom = ["#16a34a" if v >= 0 else "#dc2626" for v in m_clean["mom_pct"]]
+    fig_mom.add_trace(go.Bar(
+        x=m_clean["mes_label"], y=m_clean["mom_pct"],
+        marker_color=colors_mom, name="MoM %",
+    ))
+    fig_mom.update_layout(yaxis_title="Variación %", xaxis_title="", margin=dict(t=10))
+    fig_mom.add_hline(y=0, line_dash="solid", line_color="#94a3b8")
+    st.plotly_chart(fig_mom, use_container_width=True)
+
+
+# ======================================================== CONVERSION #
+with tab_conv:
+    st.subheader("Embudo: visitas → preguntas → ventas")
+    st.caption(
+        "Donde se rompe el embudo te dice qué optimizar. "
+        "Muchas preguntas + pocas ventas = fricción de info (precio, garantía, cuotas). "
+        "Muchas visitas + pocas preguntas = el título o la foto no enganchan."
+    )
+
+    f = metricas.funnel(v_act, vis_act, preg_act)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Visitas", f"{f['visitas']:,}")
+    c2.metric("Preguntas", f"{f['preguntas']:,}", f"{f['preguntas']/f['visitas']*100:.1f}% de visitas")
+    c3.metric("Ventas", f"{f['ventas']:,}", f"{f['ventas']/f['visitas']*100:.2f}% de visitas")
+
+    fig_funnel = go.Figure(go.Funnel(
+        y=["Visitas", "Preguntas", "Ventas"],
+        x=[f["visitas"], f["preguntas"], f["ventas"]],
+        textposition="inside", textinfo="value+percent initial",
+        marker=dict(color=["#3b82f6", "#f59e0b", "#16a34a"]),
+    ))
+    fig_funnel.update_layout(margin=dict(t=10, l=0, r=0))
+    st.plotly_chart(fig_funnel, use_container_width=True)
+
+    st.divider()
+    st.subheader("Scatter: visitas vs conversión por publicación")
+    st.caption(
+        "**Burbuja grande** = mucho GMV. **Derecha** = mucho tráfico. **Arriba** = buena conversión. "
+        "Ideal: arriba a la derecha. "
+        "Peligro: abajo a la derecha (mucho tráfico que no convierte = problema de precio/foto). "
+        "Oportunidad: arriba a la izquierda (convierte bien pero le falta tráfico = invertir en visitas)."
+    )
+
+    scatter_df = metricas.conversion_por_publicacion(v_act, vis_act)
+    if not scatter_df.empty:
+        fig_sc = px.scatter(
+            scatter_df,
+            x="visitas", y="conversion",
+            size="ingreso", color="marca",
+            hover_name="titulo",
+            hover_data={"visitas": True, "conversion": ":.2f", "ingreso": ":,.0f", "ordenes": True},
+            size_max=50,
+            labels={"visitas": "Visitas", "conversion": "Conversión %", "marca": "Marca"},
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
+        fig_sc.update_layout(margin=dict(t=10))
+        st.plotly_chart(fig_sc, use_container_width=True)
+
+
+# ======================================================= CONCENTRACION #
+with tab_conc:
+    st.subheader("Curva de Pareto — concentración de GMV por SKU")
+    st.caption(
+        "Las barras son el GMV de cada SKU (orden desc). La línea es el % acumulado. "
+        "A = primeros SKUs hasta el 70% del GMV (críticos — si caen, duele). "
+        "B = hasta el 90%. C = cola larga. "
+        "Si el 80% del GMV está en 1-2 SKUs, tenés riesgo de concentración."
+    )
+
+    pareto = metricas.pareto_sku(v_act)
+    if not pareto.empty:
+        abc_colors = {"A": "#dc2626", "B": "#f59e0b", "C": "#6b7280"}
+        fig_par = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_par.add_trace(
+            go.Bar(
+                x=pareto["titulo"], y=pareto["ingreso"],
+                name="GMV $",
+                marker_color=[abc_colors.get(str(a), "#6b7280") for a in pareto["abc"]],
+            ),
+            secondary_y=False,
+        )
+        fig_par.add_trace(
+            go.Scatter(
+                x=pareto["titulo"], y=pareto["pct_acum"],
+                name="% acumulado", mode="lines+markers",
+                line=dict(color="#1e293b", width=2),
+            ),
+            secondary_y=True,
+        )
+        fig_par.add_hline(y=80, line_dash="dash", line_color="#f59e0b", secondary_y=True,
+                          annotation_text="80%", annotation_position="right")
+        fig_par.update_yaxes(title_text="GMV $", secondary_y=False)
+        fig_par.update_yaxes(title_text="% Acumulado", range=[0, 105], secondary_y=True)
+        fig_par.update_layout(
+            xaxis=dict(tickangle=-30), margin=dict(t=10),
+            legend=dict(orientation="h", y=-0.25),
+        )
+        st.plotly_chart(fig_par, use_container_width=True)
+
+        with st.expander("Ver tabla ABC completa"):
+            st.dataframe(
+                pareto[["titulo", "marca", "ingreso", "pct_acum", "abc"]]
+                .rename(columns={"titulo": "Producto", "marca": "Marca",
+                                 "ingreso": "GMV $", "pct_acum": "% Acum", "abc": "Clase"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Velocidad de venta por SKU")
+        st.caption("Unidades vendidas por día en el período. Detecta estrellas en ascenso y productos frenados.")
+        vel = metricas.velocidad_sku(v_act)
+        fig_vel = px.bar(
+            vel.head(10).sort_values("unidades_dia"),
+            x="unidades_dia", y="titulo", orientation="h",
+            color="unidades_dia", color_continuous_scale="Greens",
+            labels={"unidades_dia": "Unidades/día", "titulo": ""},
+        )
+        fig_vel.update_coloraxes(showscale=False)
+        st.plotly_chart(fig_vel, use_container_width=True)
+
+    with col2:
+        st.subheader("Publicaciones sin conversión")
+        st.caption("Items con ≥30 visitas y cero ventas en el período. Candidatos a optimizar o dar de baja.")
+        sin_conv = metricas.productos_sin_conversion(v_act, vis_act)
+        if sin_conv.empty:
+            st.info("Todos los items con tráfico suficiente vendieron algo en este período.")
+        else:
+            st.dataframe(
+                sin_conv[["titulo", "visitas", "ordenes"]]
+                .rename(columns={"titulo": "Producto", "visitas": "Visitas", "ordenes": "Ventas"}),
+                use_container_width=True, hide_index=True,
+            )
