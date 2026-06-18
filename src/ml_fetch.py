@@ -260,6 +260,9 @@ def fetch_all(
     Descarga y transforma todos los datos de un seller en el rango de fechas.
     Devuelve (ventas, visitas, preguntas) con el mismo schema que generar_datos.py.
     """
+    # Obtener seller_id automáticamente si no fue configurado manualmente
+    client.ensure_seller_id()
+
     # 1. Órdenes
     ventas = fetch_orders(client, desde, hasta)
 

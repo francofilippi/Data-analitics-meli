@@ -31,8 +31,14 @@ class MLClient:
     client_secret: str
     access_token: str
     refresh_token: str
-    seller_id: str
+    seller_id: str = ""  # se obtiene automaticamente de /users/me si no se configura
     refreshed: bool = field(default=False, repr=False)
+
+    def ensure_seller_id(self) -> None:
+        """Obtiene el seller_id desde /users/me si no está configurado."""
+        if not self.seller_id:
+            data = self.get("/users/me")
+            self.seller_id = str(data["id"])
 
     # ----------------------------------------------------------------------- #
     # Autenticacion                                                             #
@@ -96,12 +102,14 @@ class MLClient:
 
 
 def from_secrets(nombre: str, sec: dict) -> MLClient:
-    """Construye un MLClient desde un bloque de secrets de Streamlit."""
+    """Construye un MLClient desde un bloque de secrets de Streamlit.
+    seller_id es opcional — si no está, se obtiene automáticamente de /users/me.
+    """
     return MLClient(
         nombre=nombre,
         client_id=str(sec["client_id"]),
         client_secret=str(sec["client_secret"]),
         access_token=str(sec["access_token"]),
         refresh_token=str(sec["refresh_token"]),
-        seller_id=str(sec["seller_id"]),
+        seller_id=str(sec.get("seller_id", "")),
     )
