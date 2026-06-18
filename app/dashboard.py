@@ -40,12 +40,29 @@ st.sidebar.title("📊 Mercado Libre")
 clientes = sorted(ventas["cliente_ml"].unique())
 cliente = st.sidebar.selectbox("Cliente", clientes)
 
-PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365}
+PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
-dias = PRESETS[preset]
 
-hasta = pd.Timestamp(ventas["fecha"].max())
-desde = hasta - pd.Timedelta(days=dias - 1)
+hasta_max = pd.Timestamp(ventas["fecha"].max())
+desde_min = pd.Timestamp(ventas["fecha"].min())
+
+if PRESETS[preset] is not None:
+    dias = PRESETS[preset]
+    hasta = hasta_max
+    desde = hasta - pd.Timedelta(days=dias - 1)
+else:
+    desde_sel = st.sidebar.date_input(
+        "Desde", value=(hasta_max - pd.Timedelta(days=29)).date(),
+        min_value=desde_min.date(), max_value=hasta_max.date(),
+    )
+    hasta_sel = st.sidebar.date_input(
+        "Hasta", value=hasta_max.date(),
+        min_value=desde_min.date(), max_value=hasta_max.date(),
+    )
+    desde = pd.Timestamp(desde_sel)
+    hasta = pd.Timestamp(hasta_sel)
+    dias = max(1, (hasta - desde).days + 1)
+
 desde_prev = desde - pd.Timedelta(days=dias)
 hasta_prev = desde - pd.Timedelta(days=1)
 
