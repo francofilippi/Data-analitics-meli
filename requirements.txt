@@ -1,0 +1,7 @@
+# Stack de data science para el dashboard de Mercado Libre
+pandas>=2.2        # analisis y manipulacion de datos (el corazon de DS en Python)
+numpy>=1.26        # operaciones numericas, base de pandas
+plotly>=5.20       # graficos interactivos
+streamlit>=1.40    # dashboard web interactivo (el "frontend" sin escribir HTML)
+faker>=24.0        # generacion de datos sinteticos realistas
+openpyxl>=3.1      # para leer/escribir Excel si un cliente trae un export

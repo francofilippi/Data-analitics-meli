@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Datos generados (se regeneran con data/generar_datos.py)
+data/*.csv
+data/*.parquet
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Entorno
+.env
