@@ -15,6 +15,7 @@ session_state para no perderlo entre reruns dentro de la misma sesión.
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -34,6 +35,9 @@ class MLClient:
     seller_id: str = ""  # se obtiene automaticamente de /users/me si no se configura
     refreshed: bool = field(default=False, repr=False)
 
+    def __post_init__(self):
+        self._lock = threading.Lock()
+
     def ensure_seller_id(self) -> None:
         """Obtiene el seller_id desde /users/me si no está configurado."""
         if not self.seller_id:
@@ -47,22 +51,23 @@ class MLClient:
         return {"Authorization": f"Bearer {self.access_token}"}
 
     def refresh(self) -> None:
-        """Refresca el access_token con el refresh_token actual."""
-        resp = _SESSION.post(
-            f"{ML_BASE}/oauth/token",
-            data={
-                "grant_type": "refresh_token",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "refresh_token": self.refresh_token,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self.access_token = data["access_token"]
-        self.refresh_token = data["refresh_token"]
-        self.refreshed = True
+        """Refresca el access_token con el refresh_token actual (thread-safe)."""
+        with self._lock:
+            resp = _SESSION.post(
+                f"{ML_BASE}/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "refresh_token": self.refresh_token,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self.access_token = data["access_token"]
+            self.refresh_token = data["refresh_token"]
+            self.refreshed = True
 
     # ----------------------------------------------------------------------- #
     # HTTP                                                                     #

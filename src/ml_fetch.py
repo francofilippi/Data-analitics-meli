@@ -14,6 +14,7 @@ Endpoints usados:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 import pandas as pd
@@ -175,32 +176,32 @@ def fetch_visits_daily(
     varias llamadas o interpolando.
     """
     dias_total = (hasta - desde).days + 1
+    dias_req = min(dias_total, 90)
     filas: list[dict] = []
 
-    for item_id in item_ids:
+    def _fetch_one(item_id: str) -> list[dict]:
         try:
-            # ML acepta hasta 90 días por llamada
-            dias_req = min(dias_total, 90)
             resp = client.get(
                 f"/items/{item_id}/visits/time_window",
-                params={
-                    "last": dias_req,
-                    "unit": "day",
-                    "ending": hasta.isoformat(),
-                },
+                params={"last": dias_req, "unit": "day", "ending": hasta.isoformat()},
             )
-            for entry in resp.get("results", []):
-                dia = pd.Timestamp(entry["date"]).date()
-                if desde <= dia <= hasta:
-                    filas.append({
-                        "fecha": dia,
-                        "cliente_ml": client.nombre,
-                        "item_id": item_id,
-                        "visitas": entry.get("total", 0),
-                    })
+            return [
+                {
+                    "fecha": pd.Timestamp(e["date"]).date(),
+                    "cliente_ml": client.nombre,
+                    "item_id": item_id,
+                    "visitas": e.get("total", 0),
+                }
+                for e in resp.get("results", [])
+                if desde <= pd.Timestamp(e["date"]).date() <= hasta
+            ]
         except Exception:
-            # Si falla para un item, seguimos con los demás
-            continue
+            return []
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_fetch_one, iid): iid for iid in item_ids}
+        for fut in as_completed(futures):
+            filas.extend(fut.result())
 
     return pd.DataFrame(filas) if filas else pd.DataFrame(
         columns=["fecha", "cliente_ml", "item_id", "visitas"]

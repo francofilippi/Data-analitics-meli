@@ -50,33 +50,112 @@ def _ml_client(nombre: str):
     return None
 
 
-@st.cache_data(ttl=3600, show_spinner="Cargando datos de Mercado Libre…")
-def _datos_cliente(nombre: str, desde: str, hasta: str, usar_ml: bool):
-    """
-    Cache por (cliente, desde, hasta, fuente). TTL 1 hora para datos reales.
-    Las fechas entran como string para que sean hashables por el cache.
+# --------------------------------------------------------------------------- #
+# Cache en disco — /tmp persiste entre reruns dentro de la misma instancia    #
+# --------------------------------------------------------------------------- #
+from datetime import date as _date, timedelta as _td
 
-    Lección de DS: siempre cachear las llamadas a APIs externas. Sin cache,
-    cada click en el dashboard haría decenas de llamadas a ML — lento y costoso.
+_DISK_CACHE = Path("/tmp/ml_dash_cache")
+
+
+def _pk(nombre: str, tag: str, kind: str) -> Path:
+    return _DISK_CACHE / f"{nombre}_{tag}_{kind}.parquet"
+
+
+def _disk_load(nombre: str, tag: str):
+    """Carga (ventas, visitas, preguntas) desde disco. None si no existe."""
+    try:
+        paths = [_pk(nombre, tag, k) for k in ("v", "vis", "preg")]
+        if all(p.exists() for p in paths):
+            return tuple(pd.read_parquet(p) for p in paths)
+    except Exception:
+        pass
+    return None
+
+
+def _disk_save(v, vis, preg, nombre: str, tag: str) -> None:
+    try:
+        _DISK_CACHE.mkdir(parents=True, exist_ok=True)
+        for df, kind in [(v, "v"), (vis, "vis"), (preg, "preg")]:
+            df.to_parquet(_pk(nombre, tag, kind), index=False)
+    except Exception:
+        pass
+
+
+def _concat3(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    if a.empty:
+        return b
+    if b.empty:
+        return a
+    return pd.concat([a, b], ignore_index=True)
+
+
+@st.cache_data(ttl=None, show_spinner="⏳ Cargando historial de ML…")
+def _datos_historico(nombre: str, desde: str, hasta: str, usar_ml: bool):
     """
-    d = pd.Timestamp(desde)
-    h = pd.Timestamp(hasta)
+    Meses cerrados (antes del mes actual) — datos inmutables.
+    TTL infinito en sesión + parquet en /tmp para sobrevivir reinicios.
+    """
+    if usar_ml:
+        tag = desde.replace("-", "") + "_" + hasta.replace("-", "")
+        cached = _disk_load(nombre, tag)
+        if cached:
+            return cached
+    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
+    client = _ml_client(nombre) if usar_ml else None
+    result = metricas.cargar_datos_cliente(nombre, d, h, client)
+    if usar_ml:
+        tag = desde.replace("-", "") + "_" + hasta.replace("-", "")
+        _disk_save(*result, nombre, tag)
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner="🔄 Actualizando datos del mes…")
+def _datos_reciente(nombre: str, desde: str, hasta: str, usar_ml: bool):
+    """Mes en curso — puede cambiar. TTL 1 hora."""
+    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
     client = _ml_client(nombre) if usar_ml else None
     return metricas.cargar_datos_cliente(nombre, d, h, client)
 
 
-@st.cache_data(ttl=3600, show_spinner="Cargando histórico…")
+def _cargar_rango(
+    nombre: str,
+    desde: pd.Timestamp,
+    hasta: pd.Timestamp,
+    usar_ml: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Divide en histórico (meses cerrados, cacheados en disco) + reciente (mes actual, TTL 1h).
+    Los meses cerrados se persisten en /tmp/ml_dash_cache como parquet.
+    """
+    hoy = _date.today()
+    mes_actual = pd.Timestamp(_date(hoy.year, hoy.month, 1))
+
+    if usar_ml and desde < mes_actual <= hasta:
+        hasta_hist = mes_actual - pd.Timedelta(days=1)
+        v_h, vis_h, preg_h = _datos_historico(nombre, str(desde.date()), str(hasta_hist.date()), True)
+        v_r, vis_r, preg_r = _datos_reciente(nombre, str(mes_actual.date()), str(hasta.date()), True)
+        return _concat3(v_h, v_r), _concat3(vis_h, vis_r), _concat3(preg_h, preg_r)
+
+    if usar_ml and hasta < mes_actual:
+        return _datos_historico(nombre, str(desde.date()), str(hasta.date()), True)
+
+    return _datos_reciente(nombre, str(desde.date()), str(hasta.date()), usar_ml)
+
+
+@st.cache_data(ttl=None, show_spinner="⏳ Cargando histórico 24 meses…")
 def _historico_cliente(nombre: str, usar_ml: bool):
-    """
-    Histórico de ventas de los últimos ~24 meses (para MoM/YoY).
-    Solo se usa en el tab de Ritmo & Tendencia. Cacheado 1h.
-    """
-    from datetime import date, timedelta
-    hasta = pd.Timestamp(date.today())
-    desde = pd.Timestamp(date.today() - timedelta(days=730))
-    client = _ml_client(nombre) if usar_ml else None
-    ventas, _, _ = metricas.cargar_datos_cliente(nombre, desde, hasta, client)
-    return ventas
+    """Ventas de los últimos 24 meses para MoM/YoY. Reutiliza el cache histórico."""
+    hoy = _date.today()
+    mes_actual = pd.Timestamp(_date(hoy.year, hoy.month, 1))
+    hasta_hist = mes_actual - pd.Timedelta(days=1)
+    desde_24m = pd.Timestamp(hoy - _td(days=730))
+    if usar_ml:
+        v_h, _, _ = _datos_historico(nombre, str(desde_24m.date()), str(hasta_hist.date()), True)
+        v_r, _, _ = _datos_reciente(nombre, str(mes_actual.date()), str(pd.Timestamp(hoy).date()), True)
+        return _concat3(v_h, v_r)
+    ventas, _, _ = metricas.cargar_datos()
+    return ventas[ventas["cliente_ml"] == nombre]
 
 
 # Datos sintéticos para saber qué clientes hay cuando no hay ML configurado
@@ -137,7 +216,6 @@ else:
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
 
-from datetime import date as _date, timedelta as _td
 hasta_max = pd.Timestamp(_date.today())
 desde_min = pd.Timestamp(_date.today() - _td(days=364))
 
@@ -163,8 +241,8 @@ hasta_prev = desde - pd.Timedelta(days=1)
 
 # Datos filtrados — ML real si hay secrets [ml_{cliente}], sintético si no.
 _usar_ml = bool(_ml_client(cliente))
-v_act, vis_act, preg_act = _datos_cliente(cliente, str(desde.date()), str(hasta.date()), _usar_ml)
-v_prev, vis_prev, _ = _datos_cliente(cliente, str(desde_prev.date()), str(hasta_prev.date()), _usar_ml)
+v_act, vis_act, preg_act = _cargar_rango(cliente, desde, hasta, _usar_ml)
+v_prev, vis_prev, _ = _cargar_rango(cliente, desde_prev, hasta_prev, _usar_ml)
 
 if _usar_ml:
     st.sidebar.success("✅ Datos reales de ML")
