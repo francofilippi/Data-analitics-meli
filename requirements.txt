@@ -5,3 +5,4 @@ plotly>=5.20       # graficos interactivos
 streamlit>=1.40    # dashboard web interactivo (el "frontend" sin escribir HTML)
 faker>=24.0        # generacion de datos sinteticos realistas
 openpyxl>=3.1      # para leer/escribir Excel si un cliente trae un export
+requests>=2.31     # HTTP client para la API de Mercado Libre
