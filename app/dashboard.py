@@ -55,9 +55,10 @@ def _ml_client(nombre: str):
 # --------------------------------------------------------------------------- #
 from datetime import date as _date, timedelta as _td
 
-# v2: el filtro de fechas de /orders/search estaba mal (faltaba prefijo
-# "order."), así que el cache v1 quedó con datos de todo el año. Bump → ignora v1.
-_DISK_CACHE = Path("/tmp/ml_dash_cache_v2")
+# Bump de versión = invalida el cache viejo en disco.
+#  v2: arregla filtro de fechas de /orders/search (datos de todo el año).
+#  v3: medio_entrega real + provincia vía /shipments (antes todo ME2).
+_DISK_CACHE = Path("/tmp/ml_dash_cache_v3")
 
 
 def _pk(nombre: str, tag: str, kind: str) -> Path:
@@ -146,15 +147,36 @@ def _cargar_rango(
 
 
 @st.cache_data(ttl=None, show_spinner="⏳ Cargando histórico 24 meses…")
+def _ventas_light(nombre: str, desde: str, hasta: str):
+    """Solo órdenes (sin envíos/visitas) para series largas. Cacheado en /tmp."""
+    tag = "light_" + desde.replace("-", "") + "_" + hasta.replace("-", "")
+    cached = _disk_load(nombre, tag)
+    if cached:
+        return cached[0]
+    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
+    client = _ml_client(nombre)
+    v, vis, preg = metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=True)
+    _disk_save(v, vis, preg, nombre, tag)
+    return v
+
+
+@st.cache_data(ttl=3600)
+def _ventas_light_reciente(nombre: str, desde: str, hasta: str):
+    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
+    client = _ml_client(nombre)
+    v, _, _ = metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=True)
+    return v
+
+
 def _historico_cliente(nombre: str, usar_ml: bool):
-    """Ventas de los últimos 24 meses para MoM/YoY. Reutiliza el cache histórico."""
+    """Ventas de los últimos 24 meses para MoM/YoY (modo liviano: solo órdenes)."""
     hoy = _date.today()
     mes_actual = pd.Timestamp(_date(hoy.year, hoy.month, 1))
     hasta_hist = mes_actual - pd.Timedelta(days=1)
     desde_24m = pd.Timestamp(hoy - _td(days=730))
     if usar_ml:
-        v_h, _, _ = _datos_historico(nombre, str(desde_24m.date()), str(hasta_hist.date()), True)
-        v_r, _, _ = _datos_reciente(nombre, str(mes_actual.date()), str(pd.Timestamp(hoy).date()), True)
+        v_h = _ventas_light(nombre, str(desde_24m.date()), str(hasta_hist.date()))
+        v_r = _ventas_light_reciente(nombre, str(mes_actual.date()), str(pd.Timestamp(hoy).date()))
         return _concat3(v_h, v_r)
     ventas, _, _ = metricas.cargar_datos()
     return ventas[ventas["cliente_ml"] == nombre]

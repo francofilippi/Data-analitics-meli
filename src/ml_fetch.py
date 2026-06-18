@@ -36,9 +36,11 @@ _LOGISTIC_MAP = {
     "fulfillment": "Full",
     "self_service": "Flex",
     "me2": "MercadoEnvios2",
-    "not_specified": "Retiro en local",
+    "not_specified": "Retiro / Acordar",
+    "custom": "Retiro / Acordar",
     "drop_off": "MercadoEnvios2",
     "xd_drop_off": "MercadoEnvios2",
+    "cross_docking": "MercadoEnvios2",
 }
 
 COMISION_PCT = {"clasica": 0.13, "premium": 0.18}
@@ -86,6 +88,7 @@ def fetch_orders(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
             },
         )
         for order in orders:
+            shipping_id = (order.get("shipping") or {}).get("id", "")
             for oi in order.get("order_items", []):
                 tipo = _tipo_pub(oi.get("listing_type_id", ""))
                 unidades = oi.get("quantity", 1)
@@ -100,24 +103,60 @@ def fetch_orders(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
                     "categoria": "",     # enriquecido en fetch_all
                     "marca": "",
                     "tipo_publicacion": tipo,
-                    "medio_entrega": _medio_entrega(order.get("shipping") or {}),
+                    "shipping_id": str(shipping_id) if shipping_id else "",
+                    "medio_entrega": "MercadoEnvios2",  # enriquecido vía /shipments en fetch_all
                     "unidades": unidades,
                     "precio_unitario": precio,
                     "ingreso": ingreso,
                     "comision_ml": round(ingreso * COMISION_PCT.get(tipo, 0.13), 2),
                     "costo_envio": float(order.get("shipping_cost") or 0),
-                    "provincia": "",     # requiere /shipments/{id}, se agrega luego
+                    "provincia": "",     # enriquecido vía /shipments en fetch_all
                     "estado": "pagado" if status == "paid" else "cancelado",
                 })
 
     if not filas:
         return pd.DataFrame(columns=[
             "order_id", "fecha", "cliente_ml", "item_id", "titulo",
-            "categoria", "marca", "tipo_publicacion", "medio_entrega",
+            "categoria", "marca", "tipo_publicacion", "shipping_id", "medio_entrega",
             "unidades", "precio_unitario", "ingreso", "comision_ml",
             "costo_envio", "provincia", "estado",
         ])
     return pd.DataFrame(filas)
+
+
+# --------------------------------------------------------------------------- #
+# 1b. Envíos — logistic_type (medio de entrega real) + provincia              #
+# --------------------------------------------------------------------------- #
+def fetch_shipments(client: MLClient, shipping_ids: list[str]) -> dict[str, dict]:
+    """
+    Para cada envío trae el logistic_type real (Flex/Full/ME2/Retiro) y la
+    provincia del comprador. /orders/search NO trae el logistic_type, solo el
+    id del envío — por eso hay que pegarle a /shipments/{id}.
+
+    Se consulta en paralelo (4 workers) y se cachea en el parquet histórico,
+    así solo se hace una vez por envío.
+    """
+    info: dict[str, dict] = {}
+
+    def _one(sid: str) -> tuple[str, dict]:
+        try:
+            s = client.get(f"/shipments/{sid}")
+            logistic = s.get("logistic_type") or (s.get("logistic") or {}).get("type", "")
+            addr = s.get("receiver_address") or {}
+            provincia = (addr.get("state") or {}).get("name", "") or ""
+            return sid, {
+                "medio_entrega": _LOGISTIC_MAP.get(logistic, "MercadoEnvios2"),
+                "provincia": provincia or "Sin dato",
+            }
+        except Exception:
+            return sid, {}
+
+    ids = [s for s in shipping_ids if s]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for sid, data in pool.map(_one, ids):
+            if data:
+                info[sid] = data
+    return info
 
 
 # --------------------------------------------------------------------------- #
@@ -157,7 +196,7 @@ def fetch_item_details(client: MLClient, item_ids: list[str]) -> dict[str, dict]
         batch = item_ids[i : i + 20]
         resp = client.get(
             "/items",
-            params={"ids": ",".join(batch), "attributes": "id,category_id,attributes"},
+            params={"ids": ",".join(batch), "attributes": "id,title,category_id,attributes"},
         )
         # La respuesta es una lista [{code: 200, body: {...}}, ...]
         if isinstance(resp, list):
@@ -172,10 +211,28 @@ def fetch_item_details(client: MLClient, item_ids: list[str]) -> dict[str, dict]
                             marca = attr.get("value_name", "")
                             break
                     details[item_id] = {
+                        "titulo": body.get("title", ""),
                         "categoria": _nombre_categoria(client, body.get("category_id", "")),
                         "marca": marca or "Sin marca",
                     }
     return details
+
+
+def fetch_active_item_ids(client: MLClient) -> list[str]:
+    """
+    IDs de TODAS las publicaciones activas del seller.
+
+    Necesario para conversión fidedigna: si solo miramos visitas de items que
+    vendieron, la tasa de conversión queda inflada (faltan los items con
+    tráfico y cero ventas). Con el catálogo completo el embudo es real.
+    """
+    try:
+        return client.paginate(
+            f"/users/{client.seller_id}/items/search",
+            params={"status": "active"},
+        )
+    except Exception:
+        return []
 
 
 # --------------------------------------------------------------------------- #
@@ -283,10 +340,15 @@ def fetch_all(
     client: MLClient,
     desde: date,
     hasta: date,
+    full: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Descarga y transforma todos los datos de un seller en el rango de fechas.
     Devuelve (ventas, visitas, preguntas) con el mismo schema que generar_datos.py.
+
+    full=False: modo liviano para series largas (MoM/YoY). Solo trae órdenes —
+    omite envíos, visitas, catálogo y preguntas, que para esos cálculos no se
+    usan y dispararían miles de llamadas (una /shipments por orden).
     """
     # Obtener seller_id automáticamente si no fue configurado manualmente
     client.ensure_seller_id()
@@ -294,35 +356,55 @@ def fetch_all(
     # 1. Órdenes
     ventas = fetch_orders(client, desde, hasta)
 
-    # 2. Enriquecer con detalles de items (categoría, marca)
+    if not full:
+        vacio_vis = pd.DataFrame(columns=["fecha", "cliente_ml", "item_id", "visitas"])
+        vacio_preg = pd.DataFrame(columns=["fecha", "cliente_ml", "item_id", "preguntas"])
+        if not ventas.empty:
+            ventas["fecha"] = pd.to_datetime(ventas["fecha"])
+        return ventas, vacio_vis, vacio_preg
+
+    # Catálogo de items para visitas/conversión: TODOS los activos + los que
+    # vendieron en el período (pueden estar pausados hoy). La unión evita
+    # inflar la conversión por mirar solo items que vendieron.
+    sold_ids = ventas["item_id"].unique().tolist() if not ventas.empty else []
+    active_ids = fetch_active_item_ids(client)
+    all_ids = sorted(set(sold_ids) | set(active_ids))
+
+    # 2. Detalles de items (título, categoría, marca) para todo el catálogo
+    details = fetch_item_details(client, all_ids) if all_ids else {}
+    titulo_map = {iid: d.get("titulo", "") for iid, d in details.items()}
+
     if not ventas.empty:
-        item_ids = ventas["item_id"].unique().tolist()
-        details = fetch_item_details(client, item_ids)
         ventas["categoria"] = ventas["item_id"].map(
             lambda iid: details.get(iid, {}).get("categoria", "Sin categoría")
         )
         ventas["marca"] = ventas["item_id"].map(
             lambda iid: details.get(iid, {}).get("marca", "Sin marca")
         )
-        # Enriquecer títulos si están vacíos
-        titulo_map = ventas.groupby("item_id")["titulo"].first().to_dict()
-    else:
-        item_ids = []
-        titulo_map = {}
+        # Completar títulos faltantes con los del catálogo
+        ventas["titulo"] = ventas.apply(
+            lambda r: r["titulo"] or titulo_map.get(r["item_id"], ""), axis=1
+        )
 
-    # 3. Visitas
-    visitas = fetch_visits_daily(client, item_ids, desde, hasta)
-    if not visitas.empty and titulo_map:
+        # 2b. Envíos: medio de entrega real (Flex/Full/ME2) + provincia
+        ship_ids = [s for s in ventas["shipping_id"].unique().tolist() if s]
+        envios = fetch_shipments(client, ship_ids)
+        ventas["medio_entrega"] = ventas["shipping_id"].map(
+            lambda sid: envios.get(sid, {}).get("medio_entrega", "Retiro / Acordar")
+        )
+        ventas["provincia"] = ventas["shipping_id"].map(
+            lambda sid: envios.get(sid, {}).get("provincia", "Sin dato")
+        )
+
+    # 3. Visitas — de TODO el catálogo, no solo lo que vendió
+    visitas = fetch_visits_daily(client, all_ids, desde, hasta)
+    if not visitas.empty:
         visitas["titulo"] = visitas["item_id"].map(titulo_map).fillna("")
         visitas["categoria"] = visitas["item_id"].map(
             lambda iid: details.get(iid, {}).get("categoria", "")
-            if "details" in dir()
-            else ""
         )
         visitas["marca"] = visitas["item_id"].map(
             lambda iid: details.get(iid, {}).get("marca", "")
-            if "details" in dir()
-            else ""
         )
 
     # 4. Preguntas

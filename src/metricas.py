@@ -79,6 +79,7 @@ def cargar_datos_cliente(
     desde: pd.Timestamp,
     hasta: pd.Timestamp,
     ml_client=None,  # MLClient | None
+    solo_ventas: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Carga datos de UN cliente para el rango desde..hasta.
@@ -86,12 +87,14 @@ def cargar_datos_cliente(
     Si ml_client es None → usa los CSV sintéticos filtrados.
     Si ml_client es un MLClient → llama a la API real de ML.
 
+    solo_ventas=True: modo liviano (solo órdenes), para series largas MoM/YoY.
+
     Esta separación permite usar el mismo dashboard con datos reales o
     sintéticos sin cambiar ninguna otra función de metricas.py.
     """
     if ml_client is not None:
         from src.ml_fetch import fetch_all
-        return fetch_all(ml_client, desde.date(), hasta.date())
+        return fetch_all(ml_client, desde.date(), hasta.date(), full=not solo_ventas)
 
     # Fallback sintético
     ventas, visitas, preguntas = cargar_datos()
