@@ -64,6 +64,20 @@ def _datos_cliente(nombre: str, desde: str, hasta: str, usar_ml: bool):
     return metricas.cargar_datos_cliente(nombre, d, h, client)
 
 
+@st.cache_data(ttl=3600, show_spinner="Cargando histórico…")
+def _historico_cliente(nombre: str, usar_ml: bool):
+    """
+    Histórico de ventas de los últimos ~24 meses (para MoM/YoY).
+    Solo se usa en el tab de Ritmo & Tendencia. Cacheado 1h.
+    """
+    from datetime import date, timedelta
+    hasta = pd.Timestamp(date.today())
+    desde = pd.Timestamp(date.today() - timedelta(days=730))
+    client = _ml_client(nombre) if usar_ml else None
+    ventas, _, _ = metricas.cargar_datos_cliente(nombre, desde, hasta, client)
+    return ventas
+
+
 # Datos sintéticos para saber qué clientes hay cuando no hay ML configurado
 @st.cache_data
 def _sinteticos():
@@ -326,7 +340,7 @@ with tab_ritmo:
         "Si noviembre siempre pega fuerte, el YoY te dice si creciste ADEMÁS del efecto seasonal."
     )
 
-    mom = metricas.mom_yoy(metricas.filtrar(ventas, cliente))
+    mom = metricas.mom_yoy(_historico_cliente(cliente, _usar_ml))
     mom_show = mom.copy()
     mom_show["GMV $"] = mom_show["ingreso"].map("${:,.0f}".format)
     mom_show["MoM %"] = mom_show["mom_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
