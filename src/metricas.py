@@ -306,8 +306,8 @@ def funnel(ventas: pd.DataFrame, visitas: pd.DataFrame, preguntas: pd.DataFrame)
     - Pocas visitas / buena conversion: el producto convierte bien pero le falta trafico.
     """
     return {
-        "visitas": int(visitas["visitas"].sum()),
-        "preguntas": int(preguntas["preguntas"].sum()),
+        "visitas": int(visitas["visitas"].sum()) if "visitas" in visitas.columns else 0,
+        "preguntas": int(preguntas["preguntas"].sum()) if "preguntas" in preguntas.columns else 0,
         "ventas": int(len(solo_pagadas(ventas))),
     }
 

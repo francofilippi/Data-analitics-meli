@@ -76,8 +76,11 @@ def _filtrar_fechas(df, desde, hasta):
 
 
 def _cat(lst) -> pd.DataFrame:
-    lst = [d for d in lst if d is not None and not d.empty]
-    return pd.concat(lst, ignore_index=True) if lst else pd.DataFrame()
+    non_empty = [d for d in lst if d is not None and not d.empty]
+    if non_empty:
+        return pd.concat(non_empty, ignore_index=True)
+    with_cols = [d for d in lst if d is not None and len(d.columns) > 0]
+    return with_cols[0] if with_cols else pd.DataFrame()
 
 
 def _fetch_mes(nombre, m_start, m_end, full):
