@@ -123,9 +123,28 @@ def fetch_orders(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # 2. Detalles de items (categoría, atributos, marca)                          #
 # --------------------------------------------------------------------------- #
+# Cache de nombres de categoría: el id (ej MLA22195) nunca cambia de nombre.
+_CAT_NOMBRE_CACHE: dict[str, str] = {}
+
+
+def _nombre_categoria(client: MLClient, cat_id: str) -> str:
+    """Resuelve el nombre legible de una categoría desde su id (cacheado)."""
+    if not cat_id:
+        return "Sin categoría"
+    if cat_id in _CAT_NOMBRE_CACHE:
+        return _CAT_NOMBRE_CACHE[cat_id]
+    try:
+        data = client.get(f"/categories/{cat_id}")
+        nombre = data.get("name", cat_id)
+    except Exception:
+        nombre = cat_id
+    _CAT_NOMBRE_CACHE[cat_id] = nombre
+    return nombre
+
+
 def fetch_item_details(client: MLClient, item_ids: list[str]) -> dict[str, dict]:
     """
-    Trae categoria y marca de cada item.
+    Trae categoria (nombre legible) y marca de cada item.
     La API acepta hasta 20 IDs por llamada (batch).
 
     Lección de DS: el "enrichment" — joinear tu tabla de hechos (órdenes)
@@ -136,7 +155,10 @@ def fetch_item_details(client: MLClient, item_ids: list[str]) -> dict[str, dict]
     # Batch de 20 para no superar el límite de la API
     for i in range(0, len(item_ids), 20):
         batch = item_ids[i : i + 20]
-        resp = client.get("/items", params={"ids": ",".join(batch)})
+        resp = client.get(
+            "/items",
+            params={"ids": ",".join(batch), "attributes": "id,category_id,attributes"},
+        )
         # La respuesta es una lista [{code: 200, body: {...}}, ...]
         if isinstance(resp, list):
             for entry in resp:
@@ -150,8 +172,8 @@ def fetch_item_details(client: MLClient, item_ids: list[str]) -> dict[str, dict]
                             marca = attr.get("value_name", "")
                             break
                     details[item_id] = {
-                        "categoria": body.get("category_id", ""),
-                        "marca": marca,
+                        "categoria": _nombre_categoria(client, body.get("category_id", "")),
+                        "marca": marca or "Sin marca",
                     }
     return details
 
@@ -228,10 +250,15 @@ def fetch_questions(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
             "sort_types": "ASC",
         },
     )
+    # Filtro de fecha del lado cliente: el endpoint a veces ignora el rango,
+    # así garantizamos que solo contamos preguntas dentro del período.
     filas: list[dict] = []
     for q in questions:
+        dia = pd.Timestamp(q["date_created"]).date()
+        if not (desde <= dia <= hasta):
+            continue
         filas.append({
-            "fecha": pd.Timestamp(q["date_created"]).date(),
+            "fecha": dia,
             "cliente_ml": client.nombre,
             "item_id": q.get("item_id", ""),
             "preguntas": 1,

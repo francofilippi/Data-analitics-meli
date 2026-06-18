@@ -258,6 +258,16 @@ def _delta(campo: str, sufijo: str = "%") -> str | None:
     return None if var is None else f"{var:+.1f}{sufijo}"
 
 
+def _money(n: float) -> str:
+    """Formato monetario compacto y legible: $814.3M, $417K, $950."""
+    n = float(n)
+    if abs(n) >= 1_000_000:
+        return f"${n / 1_000_000:,.1f}M"
+    if abs(n) >= 1_000:
+        return f"${n / 1_000:,.0f}K"
+    return f"${n:,.0f}"
+
+
 # --------------------------------------------------------------------------- #
 # Tabs                                                                         #
 # --------------------------------------------------------------------------- #
@@ -272,15 +282,17 @@ tab_res, tab_vol, tab_ritmo, tab_conv, tab_conc = st.tabs([
 # =================================================================== RESUMEN #
 with tab_res:
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("GMV", f"${kpi['ingreso']:,.0f}", _delta("ingreso"))
+    c1.metric("GMV", _money(kpi['ingreso']), _delta("ingreso"), help=f"${kpi['ingreso']:,.0f}")
     c2.metric("Órdenes", f"{kpi['ordenes']:,}", _delta("ordenes"))
-    c3.metric("Ticket promedio", f"${kpi['ticket_promedio']:,.0f}", _delta("ticket_promedio"))
+    c3.metric("Ticket promedio", _money(kpi['ticket_promedio']), _delta("ticket_promedio"),
+              help=f"${kpi['ticket_promedio']:,.0f}")
     c4.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
 
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))
     c6.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
-    c7.metric("Comisiones ML", f"${kpi['comisiones']:,.0f}", _delta("comisiones"))
+    c7.metric("Comisiones ML", _money(kpi['comisiones']), _delta("comisiones"),
+              help=f"${kpi['comisiones']:,.0f}")
     c8.metric("Cancelaciones", f"{kpi['tasa_cancelacion']:.1f}%")
 
     st.divider()
