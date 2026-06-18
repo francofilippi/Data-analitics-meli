@@ -132,16 +132,19 @@ def kpis_periodo(ventas: pd.DataFrame, visitas: pd.DataFrame) -> dict:
     ingreso = pagadas["ingreso"].sum()
     unidades = pagadas["unidades"].sum()
     ordenes = len(pagadas)
+    canceladas = int((ventas["estado"] == "cancelado").sum())
     total_visitas = visitas["visitas"].sum()
     return {
         "ingreso": float(ingreso),
         "unidades": int(unidades),
         "ordenes": ordenes,
+        "canceladas": canceladas,
+        "ordenes_total": ordenes + canceladas,
         "ticket_promedio": float(ingreso / ordenes) if ordenes else 0.0,
         "visitas": int(total_visitas),
         "conversion": float(ordenes / total_visitas * 100) if total_visitas else 0.0,
         "comisiones": float(pagadas["comision_ml"].sum()),
-        "tasa_cancelacion": float((ventas["estado"] == "cancelado").mean() * 100) if len(ventas) else 0.0,
+        "tasa_cancelacion": float(canceladas / (ordenes + canceladas) * 100) if (ordenes + canceladas) else 0.0,
     }
 
 

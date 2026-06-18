@@ -283,7 +283,14 @@ tab_res, tab_vol, tab_ritmo, tab_conv, tab_conc = st.tabs([
 with tab_res:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("GMV", _money(kpi['ingreso']), _delta("ingreso"), help=f"${kpi['ingreso']:,.0f}")
-    c2.metric("Órdenes", f"{kpi['ordenes']:,}", _delta("ordenes"))
+    c2.metric(
+        "Órdenes pagadas", f"{kpi['ordenes']:,}", _delta("ordenes"),
+        help=(
+            f"Solo ventas concretadas (pagadas). No incluye canceladas.\n\n"
+            f"Total en ML: {kpi['ordenes_total']:,} = "
+            f"{kpi['ordenes']:,} pagadas + {kpi['canceladas']:,} canceladas."
+        ),
+    )
     c3.metric("Ticket promedio", _money(kpi['ticket_promedio']), _delta("ticket_promedio"),
               help=f"${kpi['ticket_promedio']:,.0f}")
     c4.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
@@ -293,7 +300,10 @@ with tab_res:
     c6.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
     c7.metric("Comisiones ML", _money(kpi['comisiones']), _delta("comisiones"),
               help=f"${kpi['comisiones']:,.0f}")
-    c8.metric("Cancelaciones", f"{kpi['tasa_cancelacion']:.1f}%")
+    c8.metric(
+        "Cancelaciones", f"{kpi['tasa_cancelacion']:.1f}%",
+        help=f"{kpi['canceladas']:,} de {kpi['ordenes_total']:,} órdenes totales.",
+    )
 
     st.divider()
     col1, col2 = st.columns([2, 1])
