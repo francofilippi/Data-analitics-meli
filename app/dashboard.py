@@ -121,7 +121,9 @@ def _cargar_persistente(nombre, desde, hasta, full):
         if mes < mes_actual:
             if not full:
                 # Prioridad: 'lv' guardado → 'v' del preload completo → API
-                df = cached.get((mes.date(), "lv")) or cached.get((mes.date(), "v"))
+                df = cached.get((mes.date(), "lv"))
+                if df is None:
+                    df = cached.get((mes.date(), "v"))
                 if df is not None:
                     acc["lv"].append(_filtrar_fechas(df, desde, hasta))
                     continue
