@@ -150,3 +150,30 @@ def save_month(cliente: str, mes, kind: str, df: pd.DataFrame) -> None:
             )
     except Exception:
         pass
+
+
+def stats() -> pd.DataFrame:
+    """
+    Resumen de lo guardado: por cliente y kind, cuántos meses, total de filas
+    y la última actualización. Sirve para verificar que la persistencia funciona.
+    """
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT cliente, kind,
+                       count(*)        AS meses,
+                       sum(rows)       AS filas,
+                       min(mes)        AS desde,
+                       max(mes)        AS hasta,
+                       max(updated_at) AS actualizado
+                FROM {_TABLE}
+                GROUP BY cliente, kind
+                ORDER BY cliente, kind
+                """
+            )
+            cols = [d[0] for d in cur.description]
+            return pd.DataFrame(cur.fetchall(), columns=cols)
+    except Exception as e:
+        return pd.DataFrame({"error": [str(e)]})

@@ -267,6 +267,13 @@ if locked_cliente is None and _clientes_ml:
             _prog.empty()
             st.success("Histórico pre-cargado ✅" if _store_ok else "Caché temporal lista ✅")
 
+        if _store_ok and st.button("🔍 Ver estado de la base"):
+            _st = store.stats()
+            if _st.empty:
+                st.warning("La tabla está vacía — todavía no se guardó nada.")
+            else:
+                st.dataframe(_st, use_container_width=True, hide_index=True)
+
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
 
