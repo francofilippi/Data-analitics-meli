@@ -94,6 +94,8 @@ def _cargar_persistente(nombre, desde, hasta, full):
       - Meses cerrados → 1 sola query a Supabase para traer todos; los que
         faltan se bajan de ML y se guardan.
       - Mes en curso → siempre en vivo (puede cambiar), no se guarda.
+    Modo liviano (full=False): para MoM/YoY. Si el mes tiene 'v' guardado
+    (del preload completo) lo reutiliza directamente sin llamar a ML.
     """
     mes_actual = pd.Timestamp(_date.today().replace(day=1))
     kinds = ("v", "vis", "preg") if full else ("lv",)
@@ -102,28 +104,42 @@ def _cargar_persistente(nombre, desde, hasta, full):
     meses_todos = _meses(desde, hasta)
     meses_cerrados = [m for m in meses_todos if m < mes_actual]
 
-    # --- Un solo round-trip a Supabase para todos los meses cerrados ---
+    # Un solo round-trip a Supabase — en modo liviano también pedimos 'v'
+    # para reusar el preload completo sin llamar a la API de ML.
+    fetch_kinds = kinds if full else ("lv", "v")
     cached: dict = {}
     if meses_cerrados and store.enabled():
         cached = store.load_months_range(
             nombre,
             meses_cerrados[0].date(),
             meses_cerrados[-1].date(),
-            kinds,
+            fetch_kinds,
         )
 
     for mes in meses_todos:
         m_end = mes + pd.offsets.MonthEnd(1)
         if mes < mes_actual:
-            dfs = {k: cached.get((mes.date(), k)) for k in kinds}
-            if any(dfs[k] is None for k in kinds):
-                v, vis, preg = _fetch_mes(nombre, mes, m_end, full)
-                src = {"v": v, "vis": vis, "preg": preg, "lv": v}
+            if not full:
+                # Prioridad: 'lv' guardado → 'v' del preload completo → API
+                df = cached.get((mes.date(), "lv")) or cached.get((mes.date(), "v"))
+                if df is not None:
+                    acc["lv"].append(_filtrar_fechas(df, desde, hasta))
+                    continue
+                v, _, _ = _fetch_mes(nombre, mes, m_end, False)
+                store.save_month(nombre, mes.date(), "lv", v)
+                acc["lv"].append(_filtrar_fechas(v, desde, hasta))
+            else:
+                dfs = {k: cached.get((mes.date(), k)) for k in kinds}
+                # 'preg' vacío indica cache bugueado (antes del fix de paginate)
+                preg_ok = dfs.get("preg") is not None and not dfs["preg"].empty
+                if any(dfs[k] is None for k in kinds) or not preg_ok:
+                    v, vis, preg = _fetch_mes(nombre, mes, m_end, full)
+                    src = {"v": v, "vis": vis, "preg": preg}
+                    for k in kinds:
+                        store.save_month(nombre, mes.date(), k, src[k])
+                        dfs[k] = src[k]
                 for k in kinds:
-                    store.save_month(nombre, mes.date(), k, src[k])
-                    dfs[k] = src[k]
-            for k in kinds:
-                acc[k].append(_filtrar_fechas(dfs[k], desde, hasta))
+                    acc[k].append(_filtrar_fechas(dfs[k], desde, hasta))
         else:
             v, vis, preg = _fetch_mes(nombre, max(desde, mes), min(hasta, m_end), full)
             src = {"v": v, "vis": vis, "preg": preg, "lv": v}

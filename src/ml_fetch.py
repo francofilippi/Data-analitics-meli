@@ -306,6 +306,7 @@ def fetch_questions(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
             "sort_fields": "date_created",
             "sort_types": "ASC",
         },
+        results_key="questions",
     )
     # Filtro de fecha del lado cliente: el endpoint a veces ignora el rango,
     # así garantizamos que solo contamos preguntas dentro del período.

@@ -87,7 +87,13 @@ class MLClient:
         resp.raise_for_status()
         return resp.json()
 
-    def paginate(self, path: str, params: dict | None = None, limit: int = 50) -> list[dict]:
+    def paginate(
+        self,
+        path: str,
+        params: dict | None = None,
+        limit: int = 50,
+        results_key: str = "results",
+    ) -> list[dict]:
         """Recorre todas las páginas de un endpoint paginado con offset/limit."""
         params = dict(params or {})
         params["limit"] = limit
@@ -96,7 +102,7 @@ class MLClient:
 
         while True:
             data = self.get(path, params)
-            page = data.get("results", [])
+            page = data.get(results_key, [])
             results.extend(page)
             paging = data.get("paging", {})
             params["offset"] += limit
