@@ -152,6 +152,33 @@ def save_month(cliente: str, mes, kind: str, df: pd.DataFrame) -> None:
         pass
 
 
+def diagnose() -> dict:
+    """
+    Prueba la conexión SIN tragar el error (al revés que el resto del módulo).
+    Devuelve qué DSN se está usando (ofuscado) y si conectó / creó la tabla.
+    """
+    info: dict = {}
+    dsn = _dsn()
+    if not dsn:
+        info["dsn"] = None
+        info["ok"] = False
+        info["error"] = "No hay DSN configurado (faltan secrets [supabase].dsn)."
+        return info
+    # Ofuscar la password antes de mostrar
+    import re
+    info["dsn"] = re.sub(r":([^:@/]+)@", ":***@", dsn)
+    try:
+        conn = _connect()  # crea la tabla si no existe
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {_TABLE}")
+            info["filas"] = cur.fetchone()[0]
+        info["ok"] = True
+    except Exception as e:
+        info["ok"] = False
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
 def stats() -> pd.DataFrame:
     """
     Resumen de lo guardado: por cliente y kind, cuántos meses, total de filas

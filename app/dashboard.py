@@ -267,6 +267,14 @@ if locked_cliente is None and _clientes_ml:
             _prog.empty()
             st.success("Histórico pre-cargado ✅" if _store_ok else "Caché temporal lista ✅")
 
+        if st.button("🩺 Probar conexión a Supabase"):
+            _diag = store.diagnose()
+            st.write(f"DSN: `{_diag.get('dsn')}`")
+            if _diag.get("ok"):
+                st.success(f"Conectado ✅ — tabla ml_cache con {_diag.get('filas', 0)} filas.")
+            else:
+                st.error(f"❌ {_diag.get('error')}")
+
         if _store_ok and st.button("🔍 Ver estado de la base"):
             _st = store.stats()
             if _st.empty:
