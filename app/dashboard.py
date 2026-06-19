@@ -91,19 +91,31 @@ def _fetch_mes(nombre, m_start, m_end, full):
 def _cargar_persistente(nombre, desde, hasta, full):
     """
     Arma el rango mes por mes:
-      - Mes cerrado → se lee de Supabase; si falta, se baja de ML el mes
-        calendario completo y se guarda (durable, una sola vez).
+      - Meses cerrados → 1 sola query a Supabase para traer todos; los que
+        faltan se bajan de ML y se guardan.
       - Mes en curso → siempre en vivo (puede cambiar), no se guarda.
-    Así un seller que entra esporádicamente solo baja los meses nuevos.
     """
     mes_actual = pd.Timestamp(_date.today().replace(day=1))
     kinds = ("v", "vis", "preg") if full else ("lv",)
     acc = {k: [] for k in kinds}
 
-    for mes in _meses(desde, hasta):
+    meses_todos = _meses(desde, hasta)
+    meses_cerrados = [m for m in meses_todos if m < mes_actual]
+
+    # --- Un solo round-trip a Supabase para todos los meses cerrados ---
+    cached: dict = {}
+    if meses_cerrados and store.enabled():
+        cached = store.load_months_range(
+            nombre,
+            meses_cerrados[0].date(),
+            meses_cerrados[-1].date(),
+            kinds,
+        )
+
+    for mes in meses_todos:
         m_end = mes + pd.offsets.MonthEnd(1)
         if mes < mes_actual:
-            dfs = {k: store.load_month(nombre, mes.date(), k) for k in kinds}
+            dfs = {k: cached.get((mes.date(), k)) for k in kinds}
             if any(dfs[k] is None for k in kinds):
                 v, vis, preg = _fetch_mes(nombre, mes, m_end, full)
                 src = {"v": v, "vis": vis, "preg": preg, "lv": v}

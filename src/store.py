@@ -103,6 +103,34 @@ def load_month(cliente: str, mes, kind: str) -> pd.DataFrame | None:
         return None
 
 
+def load_months_range(
+    cliente: str, desde, hasta, kinds: tuple[str, ...]
+) -> dict[tuple, pd.DataFrame]:
+    """
+    Trae todos los meses del rango [desde, hasta] para los kinds pedidos en
+    UNA sola query. Devuelve dict keyed por (mes_date, kind) → DataFrame.
+    Mucho más rápido que N llamadas a load_month cuando el rango tiene varios meses.
+    """
+    result: dict[tuple, pd.DataFrame] = {}
+    try:
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT mes, kind, data FROM {_TABLE}
+                WHERE cliente = %s
+                  AND mes >= %s AND mes <= %s
+                  AND kind = ANY(%s)
+                """,
+                (cliente, desde, hasta, list(kinds)),
+            )
+            for mes, kind, data in cur.fetchall():
+                result[(mes, kind)] = pd.read_parquet(io.BytesIO(bytes(data)))
+    except Exception:
+        pass
+    return result
+
+
 def save_month(cliente: str, mes, kind: str, df: pd.DataFrame) -> None:
     """Guarda (upsert) el DataFrame para (cliente, mes, kind)."""
     try:
