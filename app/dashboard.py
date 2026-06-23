@@ -350,9 +350,9 @@ tab_res, tab_vol, tab_ritmo, tab_conv, tab_conc = st.tabs([
 
 # =================================================================== RESUMEN #
 with tab_res:
+    # Fila primaria: volumen (órdenes y unidades primero)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("GMV", _money(kpi['ingreso']), _delta("ingreso"), help=f"${kpi['ingreso']:,.0f}")
-    c2.metric(
+    c1.metric(
         "Órdenes pagadas", f"{kpi['ordenes']:,}", _delta("ordenes"),
         help=(
             f"Solo ventas concretadas (pagadas). No incluye canceladas.\n\n"
@@ -360,13 +360,15 @@ with tab_res:
             f"{kpi['ordenes']:,} pagadas + {kpi['canceladas']:,} canceladas."
         ),
     )
-    c3.metric("Ticket promedio", _money(kpi['ticket_promedio']), _delta("ticket_promedio"),
-              help=f"${kpi['ticket_promedio']:,.0f}")
-    c4.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
+    c2.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))
+    c3.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
+    c4.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
 
+    # Fila secundaria: facturación
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))
-    c6.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
+    c5.metric("GMV", _money(kpi['ingreso']), _delta("ingreso"), help=f"${kpi['ingreso']:,.0f}")
+    c6.metric("Ticket promedio", _money(kpi['ticket_promedio']), _delta("ticket_promedio"),
+              help=f"${kpi['ticket_promedio']:,.0f}")
     c7.metric("Comisiones ML", _money(kpi['comisiones']), _delta("comisiones"),
               help=f"${kpi['comisiones']:,.0f}")
     c8.metric(
@@ -377,13 +379,27 @@ with tab_res:
     st.divider()
     col1, col2 = st.columns([2, 1])
     with col1:
+        st.subheader("Unidades y órdenes por día")
         serie = metricas.serie_diaria(v_act)
-        fig = px.area(serie, x="fecha", y="ingreso", labels={"ingreso": "GMV $", "fecha": ""})
-        fig.update_traces(line_color="#2563eb", fillcolor="rgba(37,99,235,0.12)")
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Bar(x=serie["fecha"], y=serie["unidades"], name="Unidades",
+                   marker_color="rgba(37,99,235,0.45)"),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(x=serie["fecha"], y=serie["ordenes"], name="Órdenes",
+                       mode="lines", line=dict(color="#16a34a", width=2.5)),
+            secondary_y=True,
+        )
+        fig.update_yaxes(title_text="Unidades", secondary_y=False)
+        fig.update_yaxes(title_text="Órdenes", secondary_y=True)
+        fig.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))
         st.plotly_chart(fig, use_container_width=True)
     with col2:
+        st.subheader("Unidades por categoría")
         cat = metricas.por_categoria(v_act)
-        fig_cat = px.pie(cat, names="categoria", values="ingreso", hole=0.5)
+        fig_cat = px.pie(cat, names="categoria", values="unidades", hole=0.5)
         fig_cat.update_traces(textposition="outside", textinfo="label+percent")
         st.plotly_chart(fig_cat, use_container_width=True)
 
@@ -470,10 +486,10 @@ with tab_vol:
 
 # ================================================= RITMO & TENDENCIA #
 with tab_ritmo:
-    st.subheader("Ventas diarias con media móvil 7 días")
+    st.subheader("Unidades diarias con media móvil 7 días")
     st.caption(
-        "La línea fina son las ventas reales (ruidosas). La línea gruesa es la media "
-        "móvil de 7 días: suaviza el ruido del día a día y muestra la tendencia real. "
+        "La línea fina son las unidades reales vendidas (ruidosas). La línea gruesa es la "
+        "media móvil de 7 días: suaviza el ruido del día a día y muestra la tendencia real. "
         "Los sombreados son campañas de ML."
     )
 
@@ -481,11 +497,11 @@ with tab_ritmo:
 
     fig_ma = go.Figure()
     fig_ma.add_trace(go.Scatter(
-        x=serie_ma["fecha"], y=serie_ma["ingreso"],
-        name="GMV diario", line=dict(color="#93c5fd", width=1), opacity=0.7,
+        x=serie_ma["fecha"], y=serie_ma["unidades"],
+        name="Unidades diarias", line=dict(color="#93c5fd", width=1), opacity=0.7,
     ))
     fig_ma.add_trace(go.Scatter(
-        x=serie_ma["fecha"], y=serie_ma["ma7"],
+        x=serie_ma["fecha"], y=serie_ma["ma7_unidades"],
         name="Media móvil 7d", line=dict(color="#2563eb", width=2.5),
     ))
 
@@ -499,14 +515,15 @@ with tab_ritmo:
             )
 
     fig_ma.update_layout(
-        yaxis_title="GMV $", xaxis_title="",
+        yaxis_title="Unidades", xaxis_title="",
         legend=dict(orientation="h", y=-0.15), margin=dict(t=10),
     )
     st.plotly_chart(fig_ma, use_container_width=True)
 
     st.divider()
-    st.subheader("Comparativa mensual — MoM y YoY")
+    st.subheader("Comparativa mensual — MoM y YoY (órdenes)")
     st.caption(
+        "Variación calculada sobre cantidad de órdenes. "
         "MoM (month-over-month): cuánto creció vs el mes anterior. "
         "YoY (year-over-year): vs el mismo mes del año pasado — elimina la estacionalidad. "
         "Si noviembre siempre pega fuerte, el YoY te dice si creciste ADEMÁS del efecto seasonal."
@@ -519,8 +536,8 @@ with tab_ritmo:
     mom_show["YoY %"] = mom_show["yoy_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
 
     st.dataframe(
-        mom_show[["mes_label", "GMV $", "ordenes", "MoM %", "YoY %"]]
-        .rename(columns={"mes_label": "Mes", "ordenes": "Órdenes"}),
+        mom_show[["mes_label", "ordenes", "unidades", "GMV $", "MoM %", "YoY %"]]
+        .rename(columns={"mes_label": "Mes", "ordenes": "Órdenes", "unidades": "Unidades"}),
         use_container_width=True, hide_index=True,
     )
 
@@ -529,9 +546,9 @@ with tab_ritmo:
     colors_mom = ["#16a34a" if v >= 0 else "#dc2626" for v in m_clean["mom_pct"]]
     fig_mom.add_trace(go.Bar(
         x=m_clean["mes_label"], y=m_clean["mom_pct"],
-        marker_color=colors_mom, name="MoM %",
+        marker_color=colors_mom, name="MoM % órdenes",
     ))
-    fig_mom.update_layout(yaxis_title="Variación %", xaxis_title="", margin=dict(t=10))
+    fig_mom.update_layout(yaxis_title="Variación % órdenes", xaxis_title="", margin=dict(t=10))
     fig_mom.add_hline(y=0, line_dash="solid", line_color="#94a3b8")
     st.plotly_chart(fig_mom, use_container_width=True)
 

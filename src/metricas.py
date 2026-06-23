@@ -170,8 +170,10 @@ def serie_diaria(ventas: pd.DataFrame) -> pd.DataFrame:
 
 
 def serie_con_ma(ventas: pd.DataFrame, window: int = 7) -> pd.DataFrame:
-    """Serie diaria de GMV + media movil para suavizar el ruido."""
+    """Serie diaria + media movil (unidades, ordenes y GMV) para suavizar el ruido."""
     s = serie_diaria(ventas)
+    s["ma7_unidades"] = s["unidades"].rolling(window, min_periods=1).mean()
+    s["ma7_ordenes"] = s["ordenes"].rolling(window, min_periods=1).mean()
     s["ma7"] = s["ingreso"].rolling(window, min_periods=1).mean()
     return s
 
@@ -180,7 +182,11 @@ def serie_mensual(ventas: pd.DataFrame) -> pd.DataFrame:
     pagadas = solo_pagadas(ventas)
     s = (
         pagadas.resample("ME", on="fecha")
-        .agg(ingreso=("ingreso", "sum"), ordenes=("order_id", "count"))
+        .agg(
+            ingreso=("ingreso", "sum"),
+            unidades=("unidades", "sum"),
+            ordenes=("order_id", "count"),
+        )
         .reset_index()
     )
     s["mes"] = s["fecha"].dt.strftime("%Y-%m")
@@ -214,25 +220,30 @@ def ticket_diario(ventas: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 def mom_yoy(ventas: pd.DataFrame) -> pd.DataFrame:
     """
-    Tabla mensual con variacion MoM y YoY.
+    Tabla mensual con variacion MoM y YoY (calculada sobre ORDENES).
 
     MoM (month-over-month): compara cada mes con el mes anterior.
     YoY (year-over-year): compara cada mes con el mismo mes del anio anterior.
     YoY es el que elimina la estacionalidad: si noviembre siempre pega,
     el YoY te dice si creciste ADEMAS del efecto estacional.
+
+    El % se calcula sobre cantidad de ordenes (volumen operativo), no sobre GMV.
+    Igual se devuelven las columnas ingreso/unidades para mostrarlas en la tabla.
     """
     mensual = serie_mensual(ventas).copy()
-    mensual["mom_pct"] = mensual["ingreso"].pct_change() * 100
+    mensual["mom_pct"] = mensual["ordenes"].pct_change() * 100
 
     # Para YoY: unir con la misma tabla desplazada un anio
-    base = mensual[["fecha", "ingreso"]].copy()
+    base = mensual[["fecha", "ordenes"]].copy()
     base["fecha_prev"] = base["fecha"] + pd.DateOffset(years=1)
-    yoy_map = base.set_index("fecha_prev")["ingreso"].rename("ingreso_prev_year")
+    yoy_map = base.set_index("fecha_prev")["ordenes"].rename("ordenes_prev_year")
     mensual = mensual.join(yoy_map, on="fecha")
-    mensual["yoy_pct"] = (mensual["ingreso"] / mensual["ingreso_prev_year"] - 1) * 100
+    mensual["yoy_pct"] = (mensual["ordenes"] / mensual["ordenes_prev_year"] - 1) * 100
 
     mensual["mes_label"] = mensual["fecha"].dt.strftime("%b %Y")
-    return mensual[["mes_label", "fecha", "ingreso", "ordenes", "mom_pct", "yoy_pct"]].sort_values("fecha")
+    return mensual[
+        ["mes_label", "fecha", "ingreso", "unidades", "ordenes", "mom_pct", "yoy_pct"]
+    ].sort_values("fecha")
 
 
 # --------------------------------------------------------------------------- #
@@ -270,8 +281,9 @@ def top_productos(ventas: pd.DataFrame, n: int = 10) -> pd.DataFrame:
 
 def por_categoria(ventas: pd.DataFrame) -> pd.DataFrame:
     return (
-        solo_pagadas(ventas).groupby("categoria")["ingreso"]
-        .sum().sort_values(ascending=False).reset_index()
+        solo_pagadas(ventas).groupby("categoria")
+        .agg(unidades=("unidades", "sum"), ingreso=("ingreso", "sum"))
+        .sort_values("unidades", ascending=False).reset_index()
     )
 
 
