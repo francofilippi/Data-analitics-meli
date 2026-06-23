@@ -104,9 +104,14 @@ class MLClient:
             data = self.get(path, params)
             page = data.get(results_key, [])
             results.extend(page)
-            paging = data.get("paging", {})
+            # La mayoría de endpoints traen el total dentro de "paging", pero
+            # /questions/search lo expone en el top-level (total/limit/offset).
+            paging = data.get("paging") or data
+            total = paging.get("total", len(results))
             params["offset"] += limit
-            if params["offset"] >= paging.get("total", len(results)):
+            # Cortar también si la página vino vacía, para no colgarse cuando
+            # el endpoint no reporta un total fiable.
+            if not page or params["offset"] >= total:
                 break
 
         return results

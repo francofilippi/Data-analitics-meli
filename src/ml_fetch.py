@@ -301,6 +301,9 @@ def fetch_questions(client: MLClient, desde: date, hasta: date) -> pd.DataFrame:
         "/questions/search",
         params={
             "seller_id": client.seller_id,
+            # api_version=4 es obligatorio: sin él /questions/search devuelve
+            # la lista vacía aunque el seller tenga preguntas.
+            "api_version": 4,
             "date_created_from": _iso(desde),
             "date_created_to": _iso(hasta, eod=True),
             "sort_fields": "date_created",
