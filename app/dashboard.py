@@ -406,10 +406,10 @@ with tab_res:
 
 # ================================================= VOLUMEN & FACTURACION #
 with tab_vol:
-    st.subheader("GMV por marca + Ticket promedio")
+    st.subheader("Unidades por marca + Ticket promedio")
     st.caption(
-        "Las barras apiladas muestran cuánto aporta cada marca al GMV total. "
-        "La línea punteada es el ticket promedio: si sube mientras el GMV baja, "
+        "Las barras apiladas muestran cuántas unidades aporta cada marca al total. "
+        "La línea punteada es el ticket promedio: si sube mientras las unidades bajan, "
         "vendiste menos pero más caro."
     )
 
@@ -417,7 +417,7 @@ with tab_vol:
     ticket_d = metricas.ticket_diario(v_act)
 
     if not gmv_marca.empty:
-        pivot = gmv_marca.pivot(index="fecha", columns="marca", values="ingreso").fillna(0).reset_index()
+        pivot = gmv_marca.pivot(index="fecha", columns="marca", values="unidades").fillna(0).reset_index()
         marcas = [c for c in pivot.columns if c != "fecha"]
         colores = px.colors.qualitative.Set2
 
@@ -439,7 +439,7 @@ with tab_vol:
             ),
             secondary_y=True,
         )
-        fig_stack.update_yaxes(title_text="GMV $", secondary_y=False)
+        fig_stack.update_yaxes(title_text="Unidades", secondary_y=False)
         fig_stack.update_yaxes(title_text="Ticket $ (promedio)", secondary_y=True)
         fig_stack.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))
         st.plotly_chart(fig_stack, use_container_width=True)
@@ -615,31 +615,34 @@ with tab_conc:
     pareto = metricas.pareto_sku(v_act)
     if not pareto.empty:
         abc_colors = {"A": "#dc2626", "B": "#f59e0b", "C": "#6b7280"}
+        rank = list(range(1, len(pareto) + 1))
         fig_par = make_subplots(specs=[[{"secondary_y": True}]])
         fig_par.add_trace(
             go.Bar(
-                x=pareto["titulo"], y=pareto["ingreso"],
+                x=rank, y=pareto["ingreso"],
                 name="GMV $",
                 marker_color=[abc_colors.get(str(a), "#6b7280") for a in pareto["abc"]],
+                customdata=pareto[["titulo", "abc"]].values,
+                hovertemplate="<b>#%{x} · %{customdata[0]}</b><br>GMV: $%{y:,.0f}<br>Clase %{customdata[1]}<extra></extra>",
             ),
             secondary_y=False,
         )
         fig_par.add_trace(
             go.Scatter(
-                x=pareto["titulo"], y=pareto["pct_acum"],
-                name="% acumulado", mode="lines+markers",
+                x=rank, y=pareto["pct_acum"],
+                name="% acumulado", mode="lines",
                 line=dict(color="#1e293b", width=2),
+                customdata=pareto[["titulo"]].values,
+                hovertemplate="<b>#%{x} · %{customdata[0]}</b><br>Acumulado: %{y:.1f}%<extra></extra>",
             ),
             secondary_y=True,
         )
         fig_par.add_hline(y=80, line_dash="dash", line_color="#f59e0b", secondary_y=True,
                           annotation_text="80%", annotation_position="right")
+        fig_par.update_xaxes(title_text="SKUs (ordenados por GMV desc)")
         fig_par.update_yaxes(title_text="GMV $", secondary_y=False)
         fig_par.update_yaxes(title_text="% Acumulado", range=[0, 105], secondary_y=True)
-        fig_par.update_layout(
-            xaxis=dict(tickangle=-30), margin=dict(t=10),
-            legend=dict(orientation="h", y=-0.25),
-        )
+        fig_par.update_layout(margin=dict(t=10), legend=dict(orientation="h", y=-0.2))
         st.plotly_chart(fig_par, use_container_width=True)
 
         with st.expander("Ver tabla ABC completa"):

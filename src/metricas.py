@@ -194,11 +194,15 @@ def serie_mensual(ventas: pd.DataFrame) -> pd.DataFrame:
 
 
 def gmv_por_marca_tiempo(ventas: pd.DataFrame) -> pd.DataFrame:
-    """GMV diario por marca, para el area chart apilado."""
+    """Volumen diario por marca (unidades, ordenes y GMV), para el area chart apilado."""
     pagadas = solo_pagadas(ventas)
     return (
-        pagadas.groupby(["fecha", "marca"])["ingreso"]
-        .sum()
+        pagadas.groupby(["fecha", "marca"])
+        .agg(
+            ingreso=("ingreso", "sum"),
+            unidades=("unidades", "sum"),
+            ordenes=("order_id", "count"),
+        )
         .reset_index()
     )
 
