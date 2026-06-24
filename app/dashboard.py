@@ -1,1 +1,689 @@
-"""\nDashboard comercial de Mercado Libre — Streamlit.\n\nTabs:\n  Resumen           — KPIs con deltas vs periodo anterior\n  Volumen & Facturacion — GMV+unidades, marca, medio de entrega\n  Ritmo & Tendencia — serie diaria + MA7 + campanas, MoM/YoY\n  Conversion        — embudo, scatter visitas vs CVR\n  Concentracion     — Pareto ABC, productos sin conversion, velocidad SKU\n"""\n\nfrom __future__ import annotations\n\nimport sys\nfrom pathlib import Path\n\nimport pandas as pd\nimport plotly.express as px\nimport plotly.graph_objects as go\nfrom plotly.subplots import make_subplots\nimport streamlit as st\n\nsys.path.append(str(Path(__file__).resolve().parent.parent))\nfrom src import metricas  # noqa: E402\n\nst.set_page_config(page_title="Dashboard Mercado Libre", page_icon="📊", layout="wide")\n\n\n# --------------------------------------------------------------------------- #\n# Configuración de clientes ML                                                 #\n# --------------------------------------------------------------------------- #\ndef _ml_client(nombre: str):\n    """\n    Construye un MLClient desde Streamlit secrets si están configurados.\n    Devuelve None si no hay secrets ML para ese cliente (usa datos sintéticos).\n    """\n    try:\n        # La sección puede llamarse [nombre] o [ml_nombre]\n        sec = st.secrets.get(nombre) or st.secrets.get(f"ml_{nombre}")\n        if sec:\n            from src.ml_client import from_secrets\n            key = f"ml_client_{nombre}"\n            # Reusar el cliente de session_state para no re-refreshar el token\n            # en cada rerun de Streamlit (cada interacción recorre el script entero).\n            if key not in st.session_state:\n                st.session_state[key] = from_secrets(nombre, sec)\n            return st.session_state[key]\n    except Exception:\n        pass\n    return None\n\n\n# --------------------------------------------------------------------------- #\n# Carga de datos — persistente por mes (Supabase) + mes en curso en vivo      #\n# --------------------------------------------------------------------------- #\nfrom datetime import date as _date\n\nfrom src import store  # noqa: E402\n\n# Piso histórico: traemos datos desde enero 2025 en adelante (2024 no interesa).\n# Ancla el MoM/YoY, el selector de fechas y la precarga.\nHIST_DESDE = pd.Timestamp("2025-01-01")\n\n\ndef _meses(desde: pd.Timestamp, hasta: pd.Timestamp) -> list[pd.Timestamp]:\n    """Primer día de cada mes calendario que toca el rango."""\n    cur = pd.Timestamp(desde.year, desde.month, 1)\n    out = []\n    while cur <= hasta:\n        out.append(cur)\n        cur = cur + pd.offsets.MonthBegin(1)\n    return out\n\n\ndef _filtrar_fechas(df, desde, hasta):\n    if df is None or df.empty or "fecha" not in df.columns:\n        return df if df is not None else pd.DataFrame()\n    f = pd.to_datetime(df["fecha"])\n    return df[(f >= desde) & (f <= hasta)]\n\n\ndef _cat(lst) -> pd.DataFrame:\n    non_empty = [d for d in lst if d is not None and not d.empty]\n    if non_empty:\n        return pd.concat(non_empty, ignore_index=True)\n    with_cols = [d for d in lst if d is not None and len(d.columns) > 0]\n    return with_cols[0] if with_cols else pd.DataFrame()\n\n\ndef _fetch_mes(nombre, m_start, m_end, full):\n    client = _ml_client(nombre)\n    return metricas.cargar_datos_cliente(nombre, m_start, m_end, client, solo_ventas=not full)\n\n\ndef _cargar_persistente(nombre, desde, hasta, full):\n    """\n    Arma el rango mes por mes:\n      - Meses cerrados → 1 sola query a Supabase para traer todos; los que\n        faltan se bajan de ML y se guardan.\n      - Mes en curso → siempre en vivo (puede cambiar), no se guarda.\n    Modo liviano (full=False): para MoM/YoY. Si el mes tiene 'v' guardado\n    (del preload completo) lo reutiliza directamente sin llamar a ML.\n    """\n    mes_actual = pd.Timestamp(_date.today().replace(day=1))\n    kinds = ("v", "vis", "preg") if full else ("lv",)\n    acc = {k: [] for k in kinds}\n\n    meses_todos = _meses(desde, hasta)\n    meses_cerrados = [m for m in meses_todos if m < mes_actual]\n\n    # Un solo round-trip a Supabase — en modo liviano también pedimos 'v'\n    # para reusar el preload completo sin llamar a la API de ML.\n    fetch_kinds = kinds if full else ("lv", "v")\n    cached: dict = {}\n    if meses_cerrados and store.enabled():\n        cached = store.load_months_range(\n            nombre,\n            meses_cerrados[0].date(),\n            meses_cerrados[-1].date(),\n            fetch_kinds,\n        )\n\n    for mes in meses_todos:\n        m_end = mes + pd.offsets.MonthEnd(1)\n        if mes < mes_actual:\n            if not full:\n                # Prioridad: 'lv' guardado → 'v' del preload completo → API\n                df = cached.get((mes.date(), "lv"))\n                if df is None:\n                    df = cached.get((mes.date(), "v"))\n                if df is not None:\n                    acc["lv"].append(_filtrar_fechas(df, desde, hasta))\n                    continue\n                v, _, _ = _fetch_mes(nombre, mes, m_end, False)\n                store.save_month(nombre, mes.date(), "lv", v)\n                acc["lv"].append(_filtrar_fechas(v, desde, hasta))\n            else:\n                dfs = {k: cached.get((mes.date(), k)) for k in kinds}\n                # 'preg' vacío indica cache bugueado (antes del fix de paginate)\n                preg_ok = dfs.get("preg") is not None and not dfs["preg"].empty\n                if any(dfs[k] is None for k in kinds) or not preg_ok:\n                    v, vis, preg = _fetch_mes(nombre, mes, m_end, full)\n                    src = {"v": v, "vis": vis, "preg": preg}\n                    for k in kinds:\n                        store.save_month(nombre, mes.date(), k, src[k])\n                        dfs[k] = src[k]\n                for k in kinds:\n                    acc[k].append(_filtrar_fechas(dfs[k], desde, hasta))\n        else:\n            v, vis, preg = _fetch_mes(nombre, max(desde, mes), min(hasta, m_end), full)\n            src = {"v": v, "vis": vis, "preg": preg, "lv": v}\n            for k in kinds:\n                acc[k].append(src[k])\n\n    if full:\n        return _cat(acc["v"]), _cat(acc["vis"]), _cat(acc["preg"])\n    return _cat(acc["lv"]), pd.DataFrame(), pd.DataFrame()\n\n\n@st.cache_data(ttl=3600, show_spinner="Cargando datos de Mercado Libre…")\ndef _rango(nombre: str, desde: str, hasta: str, full: bool, usar_ml: bool):\n    """Resultado cacheado 1h. Con Supabase los meses cerrados ya están guardados."""\n    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)\n    if not usar_ml:\n        return metricas.cargar_datos_cliente(nombre, d, h, None, solo_ventas=not full)\n    if store.enabled():\n        return _cargar_persistente(nombre, d, h, full)\n    # Sin store configurado: baja todo en vivo (cacheado 1h).\n    client = _ml_client(nombre)\n    return metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=not full)\n\n\ndef _cargar_rango(nombre, desde, hasta, usar_ml):\n    return _rango(nombre, str(desde.date()), str(hasta.date()), True, usar_ml)\n\n\ndef _historico_cliente(nombre: str, usar_ml: bool):\n    """Ventas desde ene-2025 para MoM/YoY (modo liviano: solo órdenes)."""\n    hoy = _date.today()\n    if usar_ml:\n        v, _, _ = _rango(nombre, str(HIST_DESDE.date()), str(pd.Timestamp(hoy).date()), False, True)\n        return v\n    ventas, _, _ = metricas.cargar_datos()\n    return ventas[ventas["cliente_ml"] == nombre]\n\n\n# Datos sintéticos para saber qué clientes hay cuando no hay ML configurado\n@st.cache_data\ndef _sinteticos():\n    return metricas.cargar_datos()\n\n# --------------------------------------------------------------------------- #\n# Autenticacion por token en la URL                                            #\n# --------------------------------------------------------------------------- #\n# Sin secrets configurados (dev local) → modo admin sin restriccion.\n# Con secrets: token admin ve todo; token seller ve solo su cliente.\nparams = st.query_params\ntoken_url = params.get("token", "")\ncliente_url = params.get("cliente", "")\n\nlocked_cliente: str | None = None  # None = admin (selector libre)\n\ntry:\n    tokens: dict = dict(st.secrets.get("tokens", {}))\n    if tokens:\n        admin_token = tokens.get("admin", "")\n        if token_url and token_url == admin_token:\n            locked_cliente = None  # admin\n        elif token_url and cliente_url:\n            esperado = tokens.get(cliente_url, "")\n            if esperado and token_url == esperado:\n                locked_cliente = cliente_url\n            else:\n                st.error("🔒 Token inválido o expirado. Pedí tu link actualizado.")\n                st.stop()\n        else:\n            # Sin token → acceso admin (útil mientras no hay secrets configurados)\n            locked_cliente = None\nexcept Exception:\n    locked_cliente = None  # dev local sin secrets.toml\n\n# --------------------------------------------------------------------------- #\n# Sidebar                                                                      #\n# --------------------------------------------------------------------------- #\nst.sidebar.title("📊 Mercado Libre")\n\n# Determinar lista de clientes disponibles\n_v_sint, _, _ = _sinteticos()\n_clientes_sint = sorted(_v_sint["cliente_ml"].unique().tolist())\ntry:\n    _clientes_ml = metricas.clientes_configurados(dict(st.secrets))\nexcept Exception:\n    _clientes_ml = []\nclientes = _clientes_ml if _clientes_ml else _clientes_sint\n\nif locked_cliente:\n    cliente = locked_cliente\n    st.sidebar.markdown(f"**Cuenta:** {cliente}")\nelse:\n    cliente = st.sidebar.selectbox("Cliente", clientes)\n\n# Pre-carga de caché (solo admin con sellers reales). Útil después de cada\n# redeploy: deja en /tmp un año de órdenes + la vista de 30 días de cada seller,\n# así los clientes entran y carga al instante.\nif locked_cliente is None and _clientes_ml:\n    with st.sidebar.expander("⚙️ Mantenimiento (admin)"):\n        _store_ok = store.enabled()\n        if _store_ok:\n            st.caption(\n                "Guarda 1 año de datos por seller en Supabase (durable). "\n                "Una vez hecho, los meses cerrados no se vuelven a bajar nunca."\n            )\n        else:\n            st.caption(\n                "⚠️ Sin Supabase configurado: el caché es efímero. Configurá "\n                "[supabase].dsn en Secrets para que el histórico sea persistente."\n            )\n        if st.button("🔥 Pre-cargar desde ene-2025 (todos los sellers)"):\n            _hoy = pd.Timestamp(_date.today())\n            _prog = st.progress(0.0, text="Pre-cargando…")\n            _n = len(_clientes_ml)\n            for _i, _c in enumerate(_clientes_ml):\n                if not _ml_client(_c):\n                    continue\n                try:\n                    _cargar_rango(_c, HIST_DESDE, _hoy, True)   # full desde ene-2025\n                    _historico_cliente(_c, True)                # órdenes para MoM/YoY\n                except Exception as e:\n                    st.warning(f"{_c}: {e}")\n                _prog.progress((_i + 1) / _n, text=f"{_c} listo ({_i + 1}/{_n})")\n            _prog.empty()\n            st.success("Histórico pre-cargado ✅" if _store_ok else "Caché temporal lista ✅")\n\n        if st.button("🩺 Probar conexión a Supabase"):\n            _diag = store.diagnose()\n            st.write(f"DSN: `{_diag.get('dsn')}`")\n            if _diag.get("ok"):\n                st.success(f"Conectado ✅ — tabla ml_cache con {_diag.get('filas', 0)} filas.")\n            else:\n                st.error(f"❌ {_diag.get('error')}")\n\n        if _store_ok and st.button("🔍 Ver estado de la base"):\n            _st = store.stats()\n            if _st.empty:\n                st.warning("La tabla está vacía — todavía no se guardó nada.")\n            else:\n                st.dataframe(_st, use_container_width=True, hide_index=True)\n\nPRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}\npreset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)\n\nhasta_max = pd.Timestamp(_date.today())\ndesde_min = HIST_DESDE  # permite explorar/comparar desde ene-2025\n\nif PRESETS[preset] is not None:\n    dias = PRESETS[preset]\n    hasta = hasta_max\n    desde = hasta - pd.Timedelta(days=dias - 1)\nelse:\n    desde_sel = st.sidebar.date_input(\n        "Desde", value=(hasta_max - pd.Timedelta(days=29)).date(),\n        min_value=desde_min.date(), max_value=hasta_max.date(),\n    )\n    hasta_sel = st.sidebar.date_input(\n        "Hasta", value=hasta_max.date(),\n        min_value=desde_min.date(), max_value=hasta_max.date(),\n    )\n    desde = pd.Timestamp(desde_sel)\n    hasta = pd.Timestamp(hasta_sel)\n    dias = max(1, (hasta - desde).days + 1)\n\ndesde_prev = desde - pd.Timedelta(days=dias)\nhasta_prev = desde - pd.Timedelta(days=1)\n\n# Datos filtrados — ML real si hay secrets [ml_{cliente}], sintético si no.\n_usar_ml = bool(_ml_client(cliente))\nv_act, vis_act, preg_act = _cargar_rango(cliente, desde, hasta, _usar_ml)\nv_prev, vis_prev, _ = _cargar_rango(cliente, desde_prev, hasta_prev, _usar_ml)\n\nif _usar_ml:\n    st.sidebar.success("✅ Datos reales de ML")\n\nkpi = metricas.kpis_periodo(v_act, vis_act)\nkpi_prev = metricas.kpis_periodo(v_prev, vis_prev)\n\n\ndef _delta(campo: str, sufijo: str = "%") -> str | None:\n    var = metricas.variacion_pct(kpi[campo], kpi_prev[campo])\n    return None if var is None else f"{var:+.1f}{sufijo}"\n\n\ndef _money(n: float) -> str:\n    """Formato monetario compacto y legible: $814.3M, $417K, $950."""\n    n = float(n)\n    if abs(n) >= 1_000_000:\n        return f"${n / 1_000_000:,.1f}M"\n    if abs(n) >= 1_000:\n        return f"${n / 1_000:,.0f}K"\n    return f"${n:,.0f}"\n\n\n# --------------------------------------------------------------------------- #\n# Tabs                                                                         #\n# --------------------------------------------------------------------------- #\nst.title(f"📈 {cliente}")\nst.caption(f"{preset} · {desde.date()} → {hasta.date()} · vs período anterior")\n\ntab_res, tab_vol, tab_ritmo, tab_conv, tab_conc = st.tabs([\n    "Resumen", "Volumen & Facturación", "Ritmo & Tendencia", "Conversión", "Concentración"\n])\n\n\n# =================================================================== RESUMEN #\nwith tab_res:\n    # Fila primaria: volumen (órdenes y unidades primero)\n    c1, c2, c3, c4 = st.columns(4)\n    c1.metric(\n        "Órdenes pagadas", f"{kpi['ordenes']:,}", _delta("ordenes"),\n        help=(\n            f"Solo ventas concretadas (pagadas). No incluye canceladas.\\n\\n"\n            f"Total en ML: {kpi['ordenes_total']:,} = "\n            f"{kpi['ordenes']:,} pagadas + {kpi['canceladas']:,} canceladas."\n        ),\n    )\n    c2.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))\n    c3.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))\n    c4.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))\n\n    # Fila secundaria: facturación\n    c5, c6, c7, c8 = st.columns(4)\n    c5.metric("GMV", _money(kpi['ingreso']), _delta("ingreso"), help=f"${kpi['ingreso']:,.0f}")\n    c6.metric("Ticket promedio", _money(kpi['ticket_promedio']), _delta("ticket_promedio"),\n              help=f"${kpi['ticket_promedio']:,.0f}")\n    c7.metric("Comisiones ML", _money(kpi['comisiones']), _delta("comisiones"),\n              help=f"${kpi['comisiones']:,.0f}")\n    c8.metric(\n        "Cancelaciones", f"{kpi['tasa_cancelacion']:.1f}%",\n        help=f"{kpi['canceladas']:,} de {kpi['ordenes_total']:,} órdenes totales.",\n    )\n\n    st.divider()\n    col1, col2 = st.columns([2, 1])\n    with col1:\n        st.subheader("Unidades y órdenes por día")\n        serie = metricas.serie_diaria(v_act)\n        fig = make_subplots(specs=[[{"secondary_y": True}]])\n        fig.add_trace(\n            go.Bar(x=serie["fecha"], y=serie["unidades"], name="Unidades",\n                   marker_color="rgba(37,99,235,0.45)"),\n            secondary_y=False,\n        )\n        fig.add_trace(\n            go.Scatter(x=serie["fecha"], y=serie["ordenes"], name="Órdenes",\n                       mode="lines", line=dict(color="#16a34a", width=2.5)),\n            secondary_y=True,\n        )\n        fig.update_yaxes(title_text="Unidades", secondary_y=False)\n        fig.update_yaxes(title_text="Órdenes", secondary_y=True)\n        fig.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))\n        st.plotly_chart(fig, use_container_width=True)\n    with col2:\n        st.subheader("Unidades por categoría")\n        cat = metricas.por_categoria(v_act)\n        fig_cat = px.pie(cat, names="categoria", values="unidades", hole=0.5)\n        fig_cat.update_traces(textposition="outside", textinfo="label+percent")\n        st.plotly_chart(fig_cat, use_container_width=True)\n\n\n# ================================================= VOLUMEN & FACTURACION #\nwith tab_vol:\n    st.subheader("Unidades por marca + Ticket promedio")\n    st.caption(\n        "Las barras apiladas muestran cuántas unidades aporta cada marca al total. "\n        "La línea punteada es el ticket promedio: si sube mientras las unidades bajan, "\n        "vendiste menos pero más caro."\n    )\n\n    gmv_marca = metricas.gmv_por_marca_tiempo(v_act)\n    ticket_d = metricas.ticket_diario(v_act)\n\n    if not gmv_marca.empty:\n        pivot = gmv_marca.pivot(index="fecha", columns="marca", values="unidades").fillna(0).reset_index()\n        marcas = [c for c in pivot.columns if c != "fecha"]\n        colores = px.colors.qualitative.Set2\n\n        fig_stack = make_subplots(specs=[[{"secondary_y": True}]])\n        for i, m in enumerate(marcas):\n            fig_stack.add_trace(\n                go.Scatter(\n                    x=pivot["fecha"], y=pivot[m], name=m,\n                    stackgroup="one", fill="tonexty",\n                    line=dict(color=colores[i % len(colores)], width=0.5),\n                ),\n                secondary_y=False,\n            )\n        fig_stack.add_trace(\n            go.Scatter(\n                x=ticket_d["fecha"], y=ticket_d["ticket"],\n                name="Ticket promedio", mode="lines",\n                line=dict(color="#1e293b", width=2, dash="dot"),\n            ),\n            secondary_y=True,\n        )\n        fig_stack.update_yaxes(title_text="Unidades", secondary_y=False)\n        fig_stack.update_yaxes(title_text="Ticket $ (promedio)", secondary_y=True)\n        fig_stack.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))\n        st.plotly_chart(fig_stack, use_container_width=True)\n\n    st.divider()\n    col1, col2 = st.columns(2)\n\n    with col1:\n        st.subheader("Por medio de entrega")\n        me = metricas.por_medio_entrega(v_act)\n        fig_me = px.bar(\n            me, x="medio_entrega", y="ingreso", color="medio_entrega",\n            color_discrete_sequence=px.colors.qualitative.Pastel,\n            labels={"ingreso": "GMV $", "medio_entrega": ""},\n            text_auto=".2s",\n        )\n        fig_me.update_layout(showlegend=False)\n        st.plotly_chart(fig_me, use_container_width=True)\n\n        total_me = me["ingreso"].sum()\n        me["pct"] = (me["ingreso"] / total_me * 100).round(1)\n        st.dataframe(\n            me[["medio_entrega", "ordenes", "unidades", "ingreso", "pct"]]\n            .rename(columns={"medio_entrega": "Medio", "ordenes": "Órdenes",\n                             "unidades": "Unidades", "ingreso": "GMV $", "pct": "%"}),\n            use_container_width=True, hide_index=True,\n        )\n\n    with col2:\n        st.subheader("Top productos — GMV vs Unidades")\n        st.caption("Las barras son GMV; las etiquetas muestran las unidades vendidas.")\n        top = metricas.top_productos(v_act)\n        fig_top = px.bar(\n            top.sort_values("ingreso"),\n            x="ingreso", y="titulo", orientation="h",\n            color="ingreso", color_continuous_scale="Blues",\n            text="unidades",\n            labels={"ingreso": "GMV $", "titulo": ""},\n        )\n        fig_top.update_traces(texttemplate="%{text} u.", textposition="inside")\n        fig_top.update_coloraxes(showscale=False)\n        st.plotly_chart(fig_top, use_container_width=True)\n\n\n# ================================================= RITMO & TENDENCIA #\nwith tab_ritmo:\n    st.subheader("Unidades diarias con media móvil 7 días")\n    st.caption(\n        "La línea fina son las unidades reales vendidas (ruidosas). La línea gruesa es la "\n        "media móvil de 7 días: suaviza el ruido del día a día y muestra la tendencia real. "\n        "Los sombreados son campañas de ML."\n    )\n\n    serie_ma = metricas.serie_con_ma(v_act)\n\n    fig_ma = go.Figure()\n    fig_ma.add_trace(go.Scatter(\n        x=serie_ma["fecha"], y=serie_ma["unidades"],\n        name="Unidades diarias", line=dict(color="#93c5fd", width=1), opacity=0.7,\n    ))\n    fig_ma.add_trace(go.Scatter(\n        x=serie_ma["fecha"], y=serie_ma["ma7_unidades"],\n        name="Media móvil 7d", line=dict(color="#2563eb", width=2.5),\n    ))\n\n    # Sombreado de campañas dentro del periodo visible\n    for nombre, ini, fin in metricas.CAMPANAS:\n        if ini <= hasta and fin >= desde:\n            fig_ma.add_vrect(\n                x0=max(ini, desde), x1=min(fin, hasta),\n                fillcolor="#fbbf24", opacity=0.25, line_width=0,\n                annotation_text=nombre, annotation_position="top left",\n            )\n\n    fig_ma.update_layout(\n        yaxis_title="Unidades", xaxis_title="",\n        legend=dict(orientation="h", y=-0.15), margin=dict(t=10),\n    )\n    st.plotly_chart(fig_ma, use_container_width=True)\n\n    st.divider()\n    st.subheader("Comparativa mensual — MoM y YoY (órdenes)")\n    st.caption(\n        "Variación calculada sobre cantidad de órdenes. "\n        "MoM (month-over-month): cuánto creció vs el mes anterior. "\n        "YoY (year-over-year): vs el mismo mes del año pasado — elimina la estacionalidad. "\n        "Si noviembre siempre pega fuerte, el YoY te dice si creciste ADEMÁS del efecto seasonal."\n    )\n\n    mom = metricas.mom_yoy(_historico_cliente(cliente, _usar_ml))\n    mom_show = mom.sort_values("fecha", ascending=False).copy()\n    mom_show["GMV $"] = mom_show["ingreso"].map("${:,.0f}".format)\n    mom_show["MoM %"] = mom_show["mom_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")\n    mom_show["YoY %"] = mom_show["yoy_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")\n\n    yoy_disponibles = mom["yoy_pct"].notna().sum()\n    if yoy_disponibles == 0:\n        st.info("YoY disponible a partir del primer mes donde exista el mismo mes del año anterior (Jun 2026 en adelante).")\n\n    st.dataframe(\n        mom_show[["mes_label", "ordenes", "unidades", "GMV $", "MoM %", "YoY %"]]\n        .rename(columns={"mes_label": "Mes", "ordenes": "Órdenes", "unidades": "Unidades"}),\n        use_container_width=True, hide_index=True,\n    )\n\n    fig_mom = go.Figure()\n    m_clean = mom.dropna(subset=["mom_pct"])\n    colors_mom = ["#16a34a" if v >= 0 else "#dc2626" for v in m_clean["mom_pct"]]\n    fig_mom.add_trace(go.Bar(\n        x=m_clean["mes_label"], y=m_clean["mom_pct"],\n        marker_color=colors_mom, name="MoM % órdenes",\n    ))\n    fig_mom.update_layout(yaxis_title="Variación % órdenes", xaxis_title="", margin=dict(t=10))\n    fig_mom.add_hline(y=0, line_dash="solid", line_color="#94a3b8")\n    st.plotly_chart(fig_mom, use_container_width=True)\n\n\n# ======================================================== CONVERSION #\nwith tab_conv:\n    st.subheader("Embudo: visitas → preguntas → ventas")\n    st.caption(\n        "Donde se rompe el embudo te dice qué optimizar. "\n        "Muchas preguntas + pocas ventas = fricción de info (precio, garantía, cuotas). "\n        "Muchas visitas + pocas preguntas = el título o la foto no enganchan."\n    )\n\n    f = metricas.funnel(v_act, vis_act, preg_act)\n    c1, c2, c3 = st.columns(3)\n    c1.metric("Visitas", f"{f['visitas']:,}")\n    c2.metric("Preguntas", f"{f['preguntas']:,}", f"{f['preguntas']/f['visitas']*100:.1f}% de visitas")\n    c3.metric("Ventas", f"{f['ventas']:,}", f"{f['ventas']/f['visitas']*100:.2f}% de visitas")\n\n    fig_funnel = go.Figure(go.Funnel(\n        y=["Visitas", "Preguntas", "Ventas"],\n        x=[f["visitas"], f["preguntas"], f["ventas"]],\n        textposition="inside", textinfo="value+percent initial",\n        marker=dict(color=["#3b82f6", "#f59e0b", "#16a34a"]),\n    ))\n    fig_funnel.update_layout(margin=dict(t=10, l=0, r=0))\n    st.plotly_chart(fig_funnel, use_container_width=True)\n\n    st.divider()\n    st.subheader("Scatter: visitas vs conversión por publicación")\n    st.caption(\n        "**Burbuja grande** = mucho GMV. **Derecha** = mucho tráfico. **Arriba** = buena conversión. "\n        "Ideal: arriba a la derecha. "\n        "Peligro: abajo a la derecha (mucho tráfico que no convierte = problema de precio/foto). "\n        "Oportunidad: arriba a la izquierda (convierte bien pero le falta tráfico = invertir en visitas)."\n    )\n\n    scatter_df = metricas.conversion_por_publicacion(v_act, vis_act)\n    if not scatter_df.empty:\n        fig_sc = px.scatter(\n            scatter_df,\n            x="visitas", y="conversion",\n            size="ingreso", color="marca",\n            hover_name="titulo",\n            hover_data={"visitas": True, "conversion": ":.2f", "ingreso": ":,.0f", "ordenes": True},\n            size_max=50,\n            labels={"visitas": "Visitas", "conversion": "Conversión %", "marca": "Marca"},\n            color_discrete_sequence=px.colors.qualitative.Set2,\n        )\n        fig_sc.update_layout(margin=dict(t=10))\n        st.plotly_chart(fig_sc, use_container_width=True)\n\n\n# ======================================================= CONCENTRACION #\nwith tab_conc:\n    st.subheader("Curva de Pareto — concentración de GMV por SKU")\n    st.caption(\n        "Las barras son el GMV de cada SKU (orden desc). La línea es el % acumulado. "\n        "A = primeros SKUs hasta el 70% del GMV (críticos — si caen, duele). "\n        "B = hasta el 90%. C = cola larga. "\n        "Si el 80% del GMV está en 1-2 SKUs, tenés riesgo de concentración."\n    )\n\n    pareto = metricas.pareto_sku(v_act)\n    if not pareto.empty:\n        abc_colors = {"A": "#dc2626", "B": "#f59e0b", "C": "#6b7280"}\n        rank = list(range(1, len(pareto) + 1))\n        fig_par = make_subplots(specs=[[{"secondary_y": True}]])\n        fig_par.add_trace(\n            go.Bar(\n                x=rank, y=pareto["ingreso"],\n                name="GMV $",\n                marker_color=[abc_colors.get(str(a), "#6b7280") for a in pareto["abc"]],\n                customdata=pareto[["titulo", "abc"]].values,\n                hovertemplate="<b>#%{x} · %{customdata[0]}</b><br>GMV: $%{y:,.0f}<br>Clase %{customdata[1]}<extra></extra>",\n            ),\n            secondary_y=False,\n        )\n        fig_par.add_trace(\n            go.Scatter(\n                x=rank, y=pareto["pct_acum"],\n                name="% acumulado", mode="lines",\n                line=dict(color="#1e293b", width=2),\n                customdata=pareto[["titulo"]].values,\n                hovertemplate="<b>#%{x} · %{customdata[0]}</b><br>Acumulado: %{y:.1f}%<extra></extra>",\n            ),\n            secondary_y=True,\n        )\n        fig_par.add_hline(y=80, line_dash="dash", line_color="#f59e0b", secondary_y=True,\n                          annotation_text="80%", annotation_position="right")\n        fig_par.update_xaxes(title_text="SKUs (ordenados por GMV desc)")\n        fig_par.update_yaxes(title_text="GMV $", secondary_y=False)\n        fig_par.update_yaxes(title_text="% Acumulado", range=[0, 105], secondary_y=True)\n        fig_par.update_layout(margin=dict(t=10), legend=dict(orientation="h", y=-0.2))\n        st.plotly_chart(fig_par, use_container_width=True)\n\n        with st.expander("Ver tabla ABC completa"):\n            st.dataframe(\n                pareto[["titulo", "marca", "ingreso", "pct_acum", "abc"]]\n                .rename(columns={"titulo": "Producto", "marca": "Marca",\n                                 "ingreso": "GMV $", "pct_acum": "% Acum", "abc": "Clase"}),\n                use_container_width=True, hide_index=True,\n            )\n\n    st.divider()\n    col1, col2 = st.columns(2)\n\n    with col1:\n        st.subheader("Velocidad de venta por SKU")\n        st.caption("Unidades vendidas por día en el período. Detecta estrellas en ascenso y productos frenados.")\n        vel = metricas.velocidad_sku(v_act)\n        fig_vel = px.bar(\n            vel.head(10).sort_values("unidades_dia"),\n            x="unidades_dia", y="titulo", orientation="h",\n            color="unidades_dia", color_continuous_scale="Greens",\n            labels={"unidades_dia": "Unidades/día", "titulo": ""},\n        )\n        fig_vel.update_coloraxes(showscale=False)\n        st.plotly_chart(fig_vel, use_container_width=True)\n\n    with col2:\n        st.subheader("Publicaciones sin conversión")\n        st.caption("Items con ≥30 visitas y cero ventas en el período. Candidatos a optimizar o dar de baja.")\n        sin_conv = metricas.productos_sin_conversion(v_act, vis_act)\n        if sin_conv.empty:\n            st.info("Todos los items con tráfico suficiente vendieron algo en este período.")\n        else:\n            st.dataframe(\n                sin_conv[["titulo", "visitas", "ordenes"]]\n                .rename(columns={"titulo": "Producto", "visitas": "Visitas", "ordenes": "Ventas"}),\n                use_container_width=True, hide_index=True,\n            )\n
+"""
+Dashboard comercial de Mercado Libre — Streamlit.
+
+Tabs:
+  Resumen           — KPIs con deltas vs periodo anterior
+  Volumen & Facturacion — GMV+unidades, marca, medio de entrega
+  Ritmo & Tendencia — serie diaria + MA7 + campanas, MoM/YoY
+  Conversion        — embudo, scatter visitas vs CVR
+  Concentracion     — Pareto ABC, productos sin conversion, velocidad SKU
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from src import metricas  # noqa: E402
+
+st.set_page_config(page_title="Dashboard Mercado Libre", page_icon="📊", layout="wide")
+
+
+# --------------------------------------------------------------------------- #
+# Configuración de clientes ML                                                 #
+# --------------------------------------------------------------------------- #
+def _ml_client(nombre: str):
+    """
+    Construye un MLClient desde Streamlit secrets si están configurados.
+    Devuelve None si no hay secrets ML para ese cliente (usa datos sintéticos).
+    """
+    try:
+        # La sección puede llamarse [nombre] o [ml_nombre]
+        sec = st.secrets.get(nombre) or st.secrets.get(f"ml_{nombre}")
+        if sec:
+            from src.ml_client import from_secrets
+            key = f"ml_client_{nombre}"
+            # Reusar el cliente de session_state para no re-refreshar el token
+            # en cada rerun de Streamlit (cada interacción recorre el script entero).
+            if key not in st.session_state:
+                st.session_state[key] = from_secrets(nombre, sec)
+            return st.session_state[key]
+    except Exception:
+        pass
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Carga de datos — persistente por mes (Supabase) + mes en curso en vivo      #
+# --------------------------------------------------------------------------- #
+from datetime import date as _date
+
+from src import store  # noqa: E402
+
+# Piso histórico: traemos datos desde enero 2025 en adelante (2024 no interesa).
+# Ancla el MoM/YoY, el selector de fechas y la precarga.
+HIST_DESDE = pd.Timestamp("2025-01-01")
+
+
+def _meses(desde: pd.Timestamp, hasta: pd.Timestamp) -> list[pd.Timestamp]:
+    """Primer día de cada mes calendario que toca el rango."""
+    cur = pd.Timestamp(desde.year, desde.month, 1)
+    out = []
+    while cur <= hasta:
+        out.append(cur)
+        cur = cur + pd.offsets.MonthBegin(1)
+    return out
+
+
+def _filtrar_fechas(df, desde, hasta):
+    if df is None or df.empty or "fecha" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    f = pd.to_datetime(df["fecha"])
+    return df[(f >= desde) & (f <= hasta)]
+
+
+def _cat(lst) -> pd.DataFrame:
+    non_empty = [d for d in lst if d is not None and not d.empty]
+    if non_empty:
+        return pd.concat(non_empty, ignore_index=True)
+    with_cols = [d for d in lst if d is not None and len(d.columns) > 0]
+    return with_cols[0] if with_cols else pd.DataFrame()
+
+
+def _fetch_mes(nombre, m_start, m_end, full):
+    client = _ml_client(nombre)
+    return metricas.cargar_datos_cliente(nombre, m_start, m_end, client, solo_ventas=not full)
+
+
+def _cargar_persistente(nombre, desde, hasta, full):
+    """
+    Arma el rango mes por mes:
+      - Meses cerrados → 1 sola query a Supabase para traer todos; los que
+        faltan se bajan de ML y se guardan.
+      - Mes en curso → siempre en vivo (puede cambiar), no se guarda.
+    Modo liviano (full=False): para MoM/YoY. Si el mes tiene 'v' guardado
+    (del preload completo) lo reutiliza directamente sin llamar a ML.
+    """
+    mes_actual = pd.Timestamp(_date.today().replace(day=1))
+    kinds = ("v", "vis", "preg") if full else ("lv",)
+    acc = {k: [] for k in kinds}
+
+    meses_todos = _meses(desde, hasta)
+    meses_cerrados = [m for m in meses_todos if m < mes_actual]
+
+    # Un solo round-trip a Supabase — en modo liviano también pedimos 'v'
+    # para reusar el preload completo sin llamar a la API de ML.
+    fetch_kinds = kinds if full else ("lv", "v")
+    cached: dict = {}
+    if meses_cerrados and store.enabled():
+        cached = store.load_months_range(
+            nombre,
+            meses_cerrados[0].date(),
+            meses_cerrados[-1].date(),
+            fetch_kinds,
+        )
+
+    for mes in meses_todos:
+        m_end = mes + pd.offsets.MonthEnd(1)
+        if mes < mes_actual:
+            if not full:
+                # Prioridad: 'lv' guardado → 'v' del preload completo → API
+                df = cached.get((mes.date(), "lv"))
+                if df is None:
+                    df = cached.get((mes.date(), "v"))
+                if df is not None:
+                    acc["lv"].append(_filtrar_fechas(df, desde, hasta))
+                    continue
+                v, _, _ = _fetch_mes(nombre, mes, m_end, False)
+                store.save_month(nombre, mes.date(), "lv", v)
+                acc["lv"].append(_filtrar_fechas(v, desde, hasta))
+            else:
+                dfs = {k: cached.get((mes.date(), k)) for k in kinds}
+                # 'preg' vacío indica cache bugueado (antes del fix de paginate)
+                preg_ok = dfs.get("preg") is not None and not dfs["preg"].empty
+                if any(dfs[k] is None for k in kinds) or not preg_ok:
+                    v, vis, preg = _fetch_mes(nombre, mes, m_end, full)
+                    src = {"v": v, "vis": vis, "preg": preg}
+                    for k in kinds:
+                        store.save_month(nombre, mes.date(), k, src[k])
+                        dfs[k] = src[k]
+                for k in kinds:
+                    acc[k].append(_filtrar_fechas(dfs[k], desde, hasta))
+        else:
+            v, vis, preg = _fetch_mes(nombre, max(desde, mes), min(hasta, m_end), full)
+            src = {"v": v, "vis": vis, "preg": preg, "lv": v}
+            for k in kinds:
+                acc[k].append(src[k])
+
+    if full:
+        return _cat(acc["v"]), _cat(acc["vis"]), _cat(acc["preg"])
+    return _cat(acc["lv"]), pd.DataFrame(), pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner="Cargando datos de Mercado Libre…")
+def _rango(nombre: str, desde: str, hasta: str, full: bool, usar_ml: bool):
+    """Resultado cacheado 1h. Con Supabase los meses cerrados ya están guardados."""
+    d, h = pd.Timestamp(desde), pd.Timestamp(hasta)
+    if not usar_ml:
+        return metricas.cargar_datos_cliente(nombre, d, h, None, solo_ventas=not full)
+    if store.enabled():
+        return _cargar_persistente(nombre, d, h, full)
+    # Sin store configurado: baja todo en vivo (cacheado 1h).
+    client = _ml_client(nombre)
+    return metricas.cargar_datos_cliente(nombre, d, h, client, solo_ventas=not full)
+
+
+def _cargar_rango(nombre, desde, hasta, usar_ml):
+    return _rango(nombre, str(desde.date()), str(hasta.date()), True, usar_ml)
+
+
+def _historico_cliente(nombre: str, usar_ml: bool):
+    """Ventas desde ene-2025 para MoM/YoY (modo liviano: solo órdenes)."""
+    hoy = _date.today()
+    if usar_ml:
+        v, _, _ = _rango(nombre, str(HIST_DESDE.date()), str(pd.Timestamp(hoy).date()), False, True)
+        return v
+    ventas, _, _ = metricas.cargar_datos()
+    return ventas[ventas["cliente_ml"] == nombre]
+
+
+# Datos sintéticos para saber qué clientes hay cuando no hay ML configurado
+@st.cache_data
+def _sinteticos():
+    return metricas.cargar_datos()
+
+# --------------------------------------------------------------------------- #
+# Autenticacion por token en la URL                                            #
+# --------------------------------------------------------------------------- #
+# Sin secrets configurados (dev local) → modo admin sin restriccion.
+# Con secrets: token admin ve todo; token seller ve solo su cliente.
+params = st.query_params
+token_url = params.get("token", "")
+cliente_url = params.get("cliente", "")
+
+locked_cliente: str | None = None  # None = admin (selector libre)
+
+try:
+    tokens: dict = dict(st.secrets.get("tokens", {}))
+    if tokens:
+        admin_token = tokens.get("admin", "")
+        if token_url and token_url == admin_token:
+            locked_cliente = None  # admin
+        elif token_url and cliente_url:
+            esperado = tokens.get(cliente_url, "")
+            if esperado and token_url == esperado:
+                locked_cliente = cliente_url
+            else:
+                st.error("🔒 Token inválido o expirado. Pedí tu link actualizado.")
+                st.stop()
+        else:
+            # Sin token → acceso admin (útil mientras no hay secrets configurados)
+            locked_cliente = None
+except Exception:
+    locked_cliente = None  # dev local sin secrets.toml
+
+# --------------------------------------------------------------------------- #
+# Sidebar                                                                      #
+# --------------------------------------------------------------------------- #
+st.sidebar.title("📊 Mercado Libre")
+
+# Determinar lista de clientes disponibles
+_v_sint, _, _ = _sinteticos()
+_clientes_sint = sorted(_v_sint["cliente_ml"].unique().tolist())
+try:
+    _clientes_ml = metricas.clientes_configurados(dict(st.secrets))
+except Exception:
+    _clientes_ml = []
+clientes = _clientes_ml if _clientes_ml else _clientes_sint
+
+if locked_cliente:
+    cliente = locked_cliente
+    st.sidebar.markdown(f"**Cuenta:** {cliente}")
+else:
+    cliente = st.sidebar.selectbox("Cliente", clientes)
+
+# Pre-carga de caché (solo admin con sellers reales). Útil después de cada
+# redeploy: deja en /tmp un año de órdenes + la vista de 30 días de cada seller,
+# así los clientes entran y carga al instante.
+if locked_cliente is None and _clientes_ml:
+    with st.sidebar.expander("⚙️ Mantenimiento (admin)"):
+        _store_ok = store.enabled()
+        if _store_ok:
+            st.caption(
+                "Guarda 1 año de datos por seller en Supabase (durable). "
+                "Una vez hecho, los meses cerrados no se vuelven a bajar nunca."
+            )
+        else:
+            st.caption(
+                "⚠️ Sin Supabase configurado: el caché es efímero. Configurá "
+                "[supabase].dsn en Secrets para que el histórico sea persistente."
+            )
+        if st.button("🔥 Pre-cargar desde ene-2025 (todos los sellers)"):
+            _hoy = pd.Timestamp(_date.today())
+            _prog = st.progress(0.0, text="Pre-cargando…")
+            _n = len(_clientes_ml)
+            for _i, _c in enumerate(_clientes_ml):
+                if not _ml_client(_c):
+                    continue
+                try:
+                    _cargar_rango(_c, HIST_DESDE, _hoy, True)   # full desde ene-2025
+                    _historico_cliente(_c, True)                # órdenes para MoM/YoY
+                except Exception as e:
+                    st.warning(f"{_c}: {e}")
+                _prog.progress((_i + 1) / _n, text=f"{_c} listo ({_i + 1}/{_n})")
+            _prog.empty()
+            st.success("Histórico pre-cargado ✅" if _store_ok else "Caché temporal lista ✅")
+
+        if st.button("🩺 Probar conexión a Supabase"):
+            _diag = store.diagnose()
+            st.write(f"DSN: `{_diag.get('dsn')}`")
+            if _diag.get("ok"):
+                st.success(f"Conectado ✅ — tabla ml_cache con {_diag.get('filas', 0)} filas.")
+            else:
+                st.error(f"❌ {_diag.get('error')}")
+
+        if _store_ok and st.button("🔍 Ver estado de la base"):
+            _st = store.stats()
+            if _st.empty:
+                st.warning("La tabla está vacía — todavía no se guardó nada.")
+            else:
+                st.dataframe(_st, use_container_width=True, hide_index=True)
+
+PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
+preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)
+
+hasta_max = pd.Timestamp(_date.today())
+desde_min = HIST_DESDE  # permite explorar/comparar desde ene-2025
+
+if PRESETS[preset] is not None:
+    dias = PRESETS[preset]
+    hasta = hasta_max
+    desde = hasta - pd.Timedelta(days=dias - 1)
+else:
+    desde_sel = st.sidebar.date_input(
+        "Desde", value=(hasta_max - pd.Timedelta(days=29)).date(),
+        min_value=desde_min.date(), max_value=hasta_max.date(),
+    )
+    hasta_sel = st.sidebar.date_input(
+        "Hasta", value=hasta_max.date(),
+        min_value=desde_min.date(), max_value=hasta_max.date(),
+    )
+    desde = pd.Timestamp(desde_sel)
+    hasta = pd.Timestamp(hasta_sel)
+    dias = max(1, (hasta - desde).days + 1)
+
+desde_prev = desde - pd.Timedelta(days=dias)
+hasta_prev = desde - pd.Timedelta(days=1)
+
+# Datos filtrados — ML real si hay secrets [ml_{cliente}], sintético si no.
+_usar_ml = bool(_ml_client(cliente))
+v_act, vis_act, preg_act = _cargar_rango(cliente, desde, hasta, _usar_ml)
+v_prev, vis_prev, _ = _cargar_rango(cliente, desde_prev, hasta_prev, _usar_ml)
+
+if _usar_ml:
+    st.sidebar.success("✅ Datos reales de ML")
+
+kpi = metricas.kpis_periodo(v_act, vis_act)
+kpi_prev = metricas.kpis_periodo(v_prev, vis_prev)
+
+
+def _delta(campo: str, sufijo: str = "%") -> str | None:
+    var = metricas.variacion_pct(kpi[campo], kpi_prev[campo])
+    return None if var is None else f"{var:+.1f}{sufijo}"
+
+
+def _money(n: float) -> str:
+    """Formato monetario compacto y legible: $814.3M, $417K, $950."""
+    n = float(n)
+    if abs(n) >= 1_000_000:
+        return f"${n / 1_000_000:,.1f}M"
+    if abs(n) >= 1_000:
+        return f"${n / 1_000:,.0f}K"
+    return f"${n:,.0f}"
+
+
+# --------------------------------------------------------------------------- #
+# Tabs                                                                         #
+# --------------------------------------------------------------------------- #
+st.title(f"📈 {cliente}")
+st.caption(f"{preset} · {desde.date()} → {hasta.date()} · vs período anterior")
+
+tab_res, tab_vol, tab_ritmo, tab_conv, tab_conc = st.tabs([
+    "Resumen", "Volumen & Facturación", "Ritmo & Tendencia", "Conversión", "Concentración"
+])
+
+
+# =================================================================== RESUMEN #
+with tab_res:
+    # Fila primaria: volumen (órdenes y unidades primero)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Órdenes pagadas", f"{kpi['ordenes']:,}", _delta("ordenes"),
+        help=(
+            f"Solo ventas concretadas (pagadas). No incluye canceladas.\n\n"
+            f"Total en ML: {kpi['ordenes_total']:,} = "
+            f"{kpi['ordenes']:,} pagadas + {kpi['canceladas']:,} canceladas."
+        ),
+    )
+    c2.metric("Unidades", f"{kpi['unidades']:,}", _delta("unidades"))
+    c3.metric("Conversión", f"{kpi['conversion']:.2f}%", _delta("conversion", " pts"))
+    c4.metric("Visitas", f"{kpi['visitas']:,}", _delta("visitas"))
+
+    # Fila secundaria: facturación
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("GMV", _money(kpi['ingreso']), _delta("ingreso"), help=f"${kpi['ingreso']:,.0f}")
+    c6.metric("Ticket promedio", _money(kpi['ticket_promedio']), _delta("ticket_promedio"),
+              help=f"${kpi['ticket_promedio']:,.0f}")
+    c7.metric("Comisiones ML", _money(kpi['comisiones']), _delta("comisiones"),
+              help=f"${kpi['comisiones']:,.0f}")
+    c8.metric(
+        "Cancelaciones", f"{kpi['tasa_cancelacion']:.1f}%",
+        help=f"{kpi['canceladas']:,} de {kpi['ordenes_total']:,} órdenes totales.",
+    )
+
+    st.divider()
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.subheader("Unidades y órdenes por día")
+        serie = metricas.serie_diaria(v_act)
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Bar(x=serie["fecha"], y=serie["unidades"], name="Unidades",
+                   marker_color="rgba(37,99,235,0.45)"),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(x=serie["fecha"], y=serie["ordenes"], name="Órdenes",
+                       mode="lines", line=dict(color="#16a34a", width=2.5)),
+            secondary_y=True,
+        )
+        fig.update_yaxes(title_text="Unidades", secondary_y=False)
+        fig.update_yaxes(title_text="Órdenes", secondary_y=True)
+        fig.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        st.subheader("Unidades por categoría")
+        cat = metricas.por_categoria(v_act)
+        fig_cat = px.pie(cat, names="categoria", values="unidades", hole=0.5)
+        fig_cat.update_traces(textposition="outside", textinfo="label+percent")
+        st.plotly_chart(fig_cat, use_container_width=True)
+
+
+# ================================================= VOLUMEN & FACTURACION #
+with tab_vol:
+    st.subheader("Unidades por marca + Ticket promedio")
+    st.caption(
+        "Las barras apiladas muestran cuántas unidades aporta cada marca al total. "
+        "La línea punteada es el ticket promedio: si sube mientras las unidades bajan, "
+        "vendiste menos pero más caro."
+    )
+
+    gmv_marca = metricas.gmv_por_marca_tiempo(v_act)
+    ticket_d = metricas.ticket_diario(v_act)
+
+    if not gmv_marca.empty:
+        pivot = gmv_marca.pivot(index="fecha", columns="marca", values="unidades").fillna(0).reset_index()
+        marcas = [c for c in pivot.columns if c != "fecha"]
+        colores = px.colors.qualitative.Set2
+
+        fig_stack = make_subplots(specs=[[{"secondary_y": True}]])
+        for i, m in enumerate(marcas):
+            fig_stack.add_trace(
+                go.Scatter(
+                    x=pivot["fecha"], y=pivot[m], name=m,
+                    stackgroup="one", fill="tonexty",
+                    line=dict(color=colores[i % len(colores)], width=0.5),
+                ),
+                secondary_y=False,
+            )
+        fig_stack.add_trace(
+            go.Scatter(
+                x=ticket_d["fecha"], y=ticket_d["ticket"],
+                name="Ticket promedio", mode="lines",
+                line=dict(color="#1e293b", width=2, dash="dot"),
+            ),
+            secondary_y=True,
+        )
+        fig_stack.update_yaxes(title_text="Unidades", secondary_y=False)
+        fig_stack.update_yaxes(title_text="Ticket $ (promedio)", secondary_y=True)
+        fig_stack.update_layout(legend=dict(orientation="h", y=-0.15), margin=dict(t=10))
+        st.plotly_chart(fig_stack, use_container_width=True)
+
+    st.divider()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Por medio de entrega")
+        me = metricas.por_medio_entrega(v_act)
+        fig_me = px.bar(
+            me, x="medio_entrega", y="ingreso", color="medio_entrega",
+            color_discrete_sequence=px.colors.qualitative.Pastel,
+            labels={"ingreso": "GMV $", "medio_entrega": ""},
+            text_auto=".2s",
+        )
+        fig_me.update_layout(showlegend=False)
+        st.plotly_chart(fig_me, use_container_width=True)
+
+        total_me = me["ingreso"].sum()
+        me["pct"] = (me["ingreso"] / total_me * 100).round(1)
+        st.dataframe(
+            me[["medio_entrega", "ordenes", "unidades", "ingreso", "pct"]]
+            .rename(columns={"medio_entrega": "Medio", "ordenes": "Órdenes",
+                             "unidades": "Unidades", "ingreso": "GMV $", "pct": "%"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    with col2:
+        st.subheader("Top productos — GMV vs Unidades")
+        st.caption("Las barras son GMV; las etiquetas muestran las unidades vendidas.")
+        top = metricas.top_productos(v_act)
+        fig_top = px.bar(
+            top.sort_values("ingreso"),
+            x="ingreso", y="titulo", orientation="h",
+            color="ingreso", color_continuous_scale="Blues",
+            text="unidades",
+            labels={"ingreso": "GMV $", "titulo": ""},
+        )
+        fig_top.update_traces(texttemplate="%{text} u.", textposition="inside")
+        fig_top.update_coloraxes(showscale=False)
+        st.plotly_chart(fig_top, use_container_width=True)
+
+
+# ================================================= RITMO & TENDENCIA #
+with tab_ritmo:
+    st.subheader("Unidades diarias con media móvil 7 días")
+    st.caption(
+        "La línea fina son las unidades reales vendidas (ruidosas). La línea gruesa es la "
+        "media móvil de 7 días: suaviza el ruido del día a día y muestra la tendencia real. "
+        "Los sombreados son campañas de ML."
+    )
+
+    serie_ma = metricas.serie_con_ma(v_act)
+
+    fig_ma = go.Figure()
+    fig_ma.add_trace(go.Scatter(
+        x=serie_ma["fecha"], y=serie_ma["unidades"],
+        name="Unidades diarias", line=dict(color="#93c5fd", width=1), opacity=0.7,
+    ))
+    fig_ma.add_trace(go.Scatter(
+        x=serie_ma["fecha"], y=serie_ma["ma7_unidades"],
+        name="Media móvil 7d", line=dict(color="#2563eb", width=2.5),
+    ))
+
+    # Sombreado de campañas dentro del periodo visible
+    for nombre, ini, fin in metricas.CAMPANAS:
+        if ini <= hasta and fin >= desde:
+            fig_ma.add_vrect(
+                x0=max(ini, desde), x1=min(fin, hasta),
+                fillcolor="#fbbf24", opacity=0.25, line_width=0,
+                annotation_text=nombre, annotation_position="top left",
+            )
+
+    fig_ma.update_layout(
+        yaxis_title="Unidades", xaxis_title="",
+        legend=dict(orientation="h", y=-0.15), margin=dict(t=10),
+    )
+    st.plotly_chart(fig_ma, use_container_width=True)
+
+    st.divider()
+    st.subheader("Comparativa mensual — MoM y YoY (órdenes)")
+    st.caption(
+        "Variación calculada sobre cantidad de órdenes. "
+        "MoM (month-over-month): cuánto creció vs el mes anterior. "
+        "YoY (year-over-year): vs el mismo mes del año pasado — elimina la estacionalidad. "
+        "Si noviembre siempre pega fuerte, el YoY te dice si creciste ADEMÁS del efecto seasonal."
+    )
+
+    mom = metricas.mom_yoy(_historico_cliente(cliente, _usar_ml))
+    mom_show = mom.sort_values("fecha", ascending=False).copy()
+    mom_show["GMV $"] = mom_show["ingreso"].map("${:,.0f}".format)
+    mom_show["MoM %"] = mom_show["mom_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+    mom_show["YoY %"] = mom_show["yoy_pct"].map(lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+
+    yoy_disponibles = mom["yoy_pct"].notna().sum()
+    if yoy_disponibles == 0:
+        st.info("YoY disponible a partir del primer mes donde exista el mismo mes del año anterior (Jun 2026 en adelante).")
+
+    st.dataframe(
+        mom_show[["mes_label", "ordenes", "unidades", "GMV $", "MoM %", "YoY %"]]
+        .rename(columns={"mes_label": "Mes", "ordenes": "Órdenes", "unidades": "Unidades"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    fig_mom = go.Figure()
+    m_clean = mom.dropna(subset=["mom_pct"])
+    colors_mom = ["#16a34a" if v >= 0 else "#dc2626" for v in m_clean["mom_pct"]]
+    fig_mom.add_trace(go.Bar(
+        x=m_clean["mes_label"], y=m_clean["mom_pct"],
+        marker_color=colors_mom, name="MoM % órdenes",
+    ))
+    fig_mom.update_layout(yaxis_title="Variación % órdenes", xaxis_title="", margin=dict(t=10))
+    fig_mom.add_hline(y=0, line_dash="solid", line_color="#94a3b8")
+    st.plotly_chart(fig_mom, use_container_width=True)
+
+
+# ======================================================== CONVERSION #
+with tab_conv:
+    st.subheader("Embudo: visitas → preguntas → ventas")
+    st.caption(
+        "Donde se rompe el embudo te dice qué optimizar. "
+        "Muchas preguntas + pocas ventas = fricción de info (precio, garantía, cuotas). "
+        "Muchas visitas + pocas preguntas = el título o la foto no enganchan."
+    )
+
+    f = metricas.funnel(v_act, vis_act, preg_act)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Visitas", f"{f['visitas']:,}")
+    c2.metric("Preguntas", f"{f['preguntas']:,}", f"{f['preguntas']/f['visitas']*100:.1f}% de visitas")
+    c3.metric("Ventas", f"{f['ventas']:,}", f"{f['ventas']/f['visitas']*100:.2f}% de visitas")
+
+    fig_funnel = go.Figure(go.Funnel(
+        y=["Visitas", "Preguntas", "Ventas"],
+        x=[f["visitas"], f["preguntas"], f["ventas"]],
+        textposition="inside", textinfo="value+percent initial",
+        marker=dict(color=["#3b82f6", "#f59e0b", "#16a34a"]),
+    ))
+    fig_funnel.update_layout(margin=dict(t=10, l=0, r=0))
+    st.plotly_chart(fig_funnel, use_container_width=True)
+
+    st.divider()
+    st.subheader("Scatter: visitas vs conversión por publicación")
+    st.caption(
+        "**Burbuja grande** = mucho GMV. **Derecha** = mucho tráfico. **Arriba** = buena conversión. "
+        "Ideal: arriba a la derecha. "
+        "Peligro: abajo a la derecha (mucho tráfico que no convierte = problema de precio/foto). "
+        "Oportunidad: arriba a la izquierda (convierte bien pero le falta tráfico = invertir en visitas)."
+    )
+
+    scatter_df = metricas.conversion_por_publicacion(v_act, vis_act)
+    if not scatter_df.empty:
+        fig_sc = px.scatter(
+            scatter_df,
+            x="visitas", y="conversion",
+            size="ingreso", color="marca",
+            hover_name="titulo",
+            hover_data={"visitas": True, "conversion": ":.2f", "ingreso": ":,.0f", "ordenes": True},
+            size_max=50,
+            labels={"visitas": "Visitas", "conversion": "Conversión %", "marca": "Marca"},
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
+        fig_sc.update_layout(margin=dict(t=10))
+        st.plotly_chart(fig_sc, use_container_width=True)
+
+
+# ======================================================= CONCENTRACION #
+with tab_conc:
+    st.subheader("Curva de Pareto — concentración de GMV por SKU")
+    st.caption(
+        "Las barras son el GMV de cada SKU (orden desc). La línea es el % acumulado. "
+        "A = primeros SKUs hasta el 70% del GMV (críticos — si caen, duele). "
+        "B = hasta el 90%. C = cola larga. "
+        "Si el 80% del GMV está en 1-2 SKUs, tenés riesgo de concentración."
+    )
+
+    pareto = metricas.pareto_sku(v_act)
+    if not pareto.empty:
+        abc_colors = {"A": "#dc2626", "B": "#f59e0b", "C": "#6b7280"}
+        rank = list(range(1, len(pareto) + 1))
+        fig_par = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_par.add_trace(
+            go.Bar(
+                x=rank, y=pareto["ingreso"],
+                name="GMV $",
+                marker_color=[abc_colors.get(str(a), "#6b7280") for a in pareto["abc"]],
+                customdata=pareto[["titulo", "abc"]].values,
+                hovertemplate="<b>#%{x} · %{customdata[0]}</b><br>GMV: $%{y:,.0f}<br>Clase %{customdata[1]}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig_par.add_trace(
+            go.Scatter(
+                x=rank, y=pareto["pct_acum"],
+                name="% acumulado", mode="lines",
+                line=dict(color="#1e293b", width=2),
+                customdata=pareto[["titulo"]].values,
+                hovertemplate="<b>#%{x} · %{customdata[0]}</b><br>Acumulado: %{y:.1f}%<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+        fig_par.add_hline(y=80, line_dash="dash", line_color="#f59e0b", secondary_y=True,
+                          annotation_text="80%", annotation_position="right")
+        fig_par.update_xaxes(title_text="SKUs (ordenados por GMV desc)")
+        fig_par.update_yaxes(title_text="GMV $", secondary_y=False)
+        fig_par.update_yaxes(title_text="% Acumulado", range=[0, 105], secondary_y=True)
+        fig_par.update_layout(margin=dict(t=10), legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig_par, use_container_width=True)
+
+        with st.expander("Ver tabla ABC completa"):
+            st.dataframe(
+                pareto[["titulo", "marca", "ingreso", "pct_acum", "abc"]]
+                .rename(columns={"titulo": "Producto", "marca": "Marca",
+                                 "ingreso": "GMV $", "pct_acum": "% Acum", "abc": "Clase"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    st.divider()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Velocidad de venta por SKU")
+        st.caption("Unidades vendidas por día en el período. Detecta estrellas en ascenso y productos frenados.")
+        vel = metricas.velocidad_sku(v_act)
+        fig_vel = px.bar(
+            vel.head(10).sort_values("unidades_dia"),
+            x="unidades_dia", y="titulo", orientation="h",
+            color="unidades_dia", color_continuous_scale="Greens",
+            labels={"unidades_dia": "Unidades/día", "titulo": ""},
+        )
+        fig_vel.update_coloraxes(showscale=False)
+        st.plotly_chart(fig_vel, use_container_width=True)
+
+    with col2:
+        st.subheader("Publicaciones sin conversión")
+        st.caption("Items con ≥30 visitas y cero ventas en el período. Candidatos a optimizar o dar de baja.")
+        sin_conv = metricas.productos_sin_conversion(v_act, vis_act)
+        if sin_conv.empty:
+            st.info("Todos los items con tráfico suficiente vendieron algo en este período.")
+        else:
+            st.dataframe(
+                sin_conv[["titulo", "visitas", "ordenes"]]
+                .rename(columns={"titulo": "Producto", "visitas": "Visitas", "ordenes": "Ventas"}),
+                use_container_width=True, hide_index=True,
+            )
