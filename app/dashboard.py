@@ -539,7 +539,16 @@ with tab_ritmo:
 
     yoy_disponibles = mom["yoy_pct"].notna().sum()
     if yoy_disponibles == 0:
-        st.info("YoY disponible a partir del primer mes donde exista el mismo mes del año anterior (Jun 2026 en adelante).")
+        if not mom.empty:
+            primer_dato = mom["fecha"].min()
+            primer_yoy = (primer_dato + pd.DateOffset(years=1)).strftime("%b %Y")
+            st.info(
+                f"Todavía no hay YoY. Tu histórico arranca en **{primer_dato.strftime('%b %Y')}**, "
+                f"y el YoY necesita el mismo mes del año anterior para comparar. "
+                f"El primer mes con YoY será **{primer_yoy}**."
+            )
+        else:
+            st.info("Sin datos suficientes para calcular YoY.")
 
     st.dataframe(
         mom_show[["mes_label", "ordenes", "unidades", "GMV $", "MoM %", "YoY %"]]
