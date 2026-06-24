@@ -56,6 +56,7 @@ def _ml_client(nombre: str):
 from datetime import date as _date
 
 from src import store  # noqa: E402
+from src import store_local  # noqa: E402
 
 # Piso histórico: traemos datos desde enero 2025 en adelante (2024 no interesa).
 # Ancla el MoM/YoY, el selector de fechas y la precarga.
@@ -108,17 +109,19 @@ def _cargar_persistente(nombre, desde, hasta, full):
     meses_todos = _meses(desde, hasta)
     meses_cerrados = [m for m in meses_todos if m < mes_actual]
 
-    # Un solo round-trip a Supabase — en modo liviano también pedimos 'v'
-    # para reusar el preload completo sin llamar a la API de ML.
+    # En modo liviano también pedimos 'v' para reusar el preload completo sin
+    # llamar a la API de ML. Prioridad de lectura: respaldo en repo (git, durable
+    # e independiente) → Supabase. El repo gana porque sobrevive aunque Supabase
+    # se pause/pierda datos; Supabase rellena los meses que aún no se snapshotearon.
     fetch_kinds = kinds if full else ("lv", "v")
     cached: dict = {}
-    if meses_cerrados and store.enabled():
-        cached = store.load_months_range(
-            nombre,
-            meses_cerrados[0].date(),
-            meses_cerrados[-1].date(),
-            fetch_kinds,
-        )
+    if meses_cerrados:
+        d0, d1 = meses_cerrados[0].date(), meses_cerrados[-1].date()
+        if store_local.enabled():
+            cached.update(store_local.load_months_range(nombre, d0, d1, fetch_kinds))
+        if store.enabled():
+            for clave, df in store.load_months_range(nombre, d0, d1, fetch_kinds).items():
+                cached.setdefault(clave, df)  # el repo tiene prioridad
 
     for mes in meses_todos:
         m_end = mes + pd.offsets.MonthEnd(1)
@@ -133,6 +136,7 @@ def _cargar_persistente(nombre, desde, hasta, full):
                     continue
                 v, _, _ = _fetch_mes(nombre, mes, m_end, False)
                 store.save_month(nombre, mes.date(), "lv", v)
+                store_local.save_month(nombre, mes.date(), "lv", v)
                 acc["lv"].append(_filtrar_fechas(v, desde, hasta))
             else:
                 dfs = {k: cached.get((mes.date(), k)) for k in kinds}
@@ -143,6 +147,7 @@ def _cargar_persistente(nombre, desde, hasta, full):
                     src = {"v": v, "vis": vis, "preg": preg}
                     for k in kinds:
                         store.save_month(nombre, mes.date(), k, src[k])
+                        store_local.save_month(nombre, mes.date(), k, src[k])
                         dfs[k] = src[k]
                 for k in kinds:
                     acc[k].append(_filtrar_fechas(dfs[k], desde, hasta))
@@ -285,6 +290,16 @@ if locked_cliente is None and _clientes_ml:
                 st.warning("La tabla está vacía — todavía no se guardó nada.")
             else:
                 st.dataframe(_st, use_container_width=True, hide_index=True)
+
+        if st.button("📦 Ver respaldo en repo (git)"):
+            _stl = store_local.stats()
+            if _stl.empty:
+                st.warning(
+                    "Sin snapshots en data/historico/. Generálos con "
+                    "`scripts/snapshot_historico.py` (vuelca Supabase → repo) y commiteá."
+                )
+            else:
+                st.dataframe(_stl, use_container_width=True, hide_index=True)
 
 PRESETS = {"7 días": 7, "30 días": 30, "90 días": 90, "1 año": 365, "Personalizado": None}
 preset = st.sidebar.radio("Período", list(PRESETS.keys()), index=1)

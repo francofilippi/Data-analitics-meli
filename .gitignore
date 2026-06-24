@@ -8,6 +8,12 @@ __pycache__/
 data/*.csv
 data/*.parquet
 
+# Respaldo durable del histórico (SÍ se versiona: es el backup del YoY).
+# Las reglas de arriba solo aplican a hijos directos de data/, no a subcarpetas,
+# pero lo explicitamos por las dudas.
+!data/historico/
+!data/historico/**
+
 # Streamlit
 .streamlit/secrets.toml
 
